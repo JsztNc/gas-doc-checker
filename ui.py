@@ -344,19 +344,37 @@ class App(object):
             btn_send.Enabled = False
             btn_send.Text = "提交中…"
 
+            # 结果放在线程间共享的普通容器里，由 UI 线程的 Timer 轮询取回，
+            # 彻底避免「后台线程回调 -> 主窗体 BeginInvoke -> 模态对话框不派发」
+            # 导致的窗口卡死（Windows 标记为「未响应」）。
+            result = {}
+
             def work():
-                ok, msg = feedback.submit(kind, text, contact.Text or "",
-                                          context=dict(self.context))
-                def back():
-                    btn_send.Enabled = True
-                    btn_send.Text = "提交反馈"
-                    MessageBox.Show(dlg, msg, "意见反馈",
-                                    MessageBoxButtons.OK,
-                                    MessageBoxIcon.Information if ok else MessageBoxIcon.Error)
-                    if ok:
-                        dlg.Close()
-                self._ui(back)
+                try:
+                    result["ok"], result["msg"] = feedback.submit(
+                        kind, text, contact.Text or "", context=dict(self.context))
+                except Exception as exc:
+                    result["ok"], result["msg"] = False, "提交失败：%s" % exc
             threading.Thread(target=work, daemon=True).start()
+
+            def tick(sender, ev):
+                if not result:                 # 后台还没返回
+                    return
+                timer.Stop()
+                if dlg.IsDisposed or not dlg.IsHandleCreated:
+                    return                     # 用户已关掉对话框，不再弹窗
+                btn_send.Enabled = True
+                btn_send.Text = "提交反馈"
+                MessageBox.Show(
+                    dlg, result["msg"], "意见反馈", MessageBoxButtons.OK,
+                    MessageBoxIcon.Information if result["ok"] else MessageBoxIcon.Error)
+                if result["ok"]:
+                    dlg.Close()
+
+            timer = System.Windows.Forms.Timer()
+            timer.Interval = 200
+            timer.Tick += tick
+            timer.Start()
         btn_send.Click += do_send
 
         dlg.ShowDialog(self.form)
