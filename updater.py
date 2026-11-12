@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-"""检查更新模块 —— 从 GitHub Releases 拉取最新版并替换文件。
+"""检查更新模块 —— 单文件版：从 GitHub Releases 下载最新 exe 并替换自己。
 
 设计要点：
-1. 只用标准库（urllib / zipfile / json），不额外装依赖，打包后也能跑。
-2. 检查、下载在后台线程做，界面通过 BeginInvoke 回调，不卡窗口。
-3. 运行中的 exe 无法覆盖自己，所以真正的替换交给一个放在系统临时目录的
-   bat 脚本：先等主程序退出，再删旧文件、解压新文件、重新启动。
-4. 只替换"程序自带"的文件；检查报告、_tmp、用户放在目录里的东西一律不动。
+1. 只用标准库（urllib / json），不额外装依赖，打包后也能跑。
+2. 程序是 PyInstaller --onefile 打出的单个 exe，运行时解压到临时目录；
+   version.txt、使用说明.txt、bin/es.exe 都作为资源打在 exe 内部。
+3. Release 只上传一个 .exe 资产（如 gas-doc-checker-v1.1.0-win64.exe）。
+   检查更新时下载这个 exe，校验是有效 PE 文件后，用系统临时目录的 bat
+   等主程序退出 → 用新 exe 覆盖旧 exe → 重新打开。
+4. 只替换 exe 自己；检查报告、_tmp、用户放在目录里的东西一律不动。
 
-GitHub 上每个版本请发一个 Release，并上传一个 zip 包，zip 内容就是整个
-程序文件夹（线上资料检查.exe、_internal、checker、*.py、版本文件等），
-可以带一层顶层目录，程序会自动识别。tag 用 v1.1.0 这种格式。
+发版：tag 用 v1.1.0，把编好的 exe 作为 Release 资产上传即可。
+老版本 v1.0.x 是 zip 整包结构，本模块也兼容读取 zip（见 _asset_from_release）。
 """
 import json
 import os
@@ -20,7 +21,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import traceback
 import urllib.error
 import urllib.request
 import zipfile
@@ -31,38 +31,40 @@ BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", 
 GITHUB_REPO = "lonyii/gas-doc-checker"
 API_LATEST = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
 RELEASES_PAGE = "https://github.com/%s/releases" % GITHUB_REPO
-VERSION_FILE = os.path.join(BASE, "version.txt")
 EXE_NAME = "线上资料检查.exe"
-
-# 更新时会先删除这些"程序自带"项，再从新包整体解压回来。
-# 故意不列：检查报告、_tmp、用户自己放进去的文件。
-MANAGED_FILES = (
-    "ui.py", "check.py", "updater.py", "version.txt", "使用说明.txt",
-    "检查资料.bat", "命令行检查.bat", "_runtime.bat", EXE_NAME,
-)
-MANAGED_DIRS = ("_internal", "checker", "bin")
+HELP_FILE = "使用说明.txt"
 
 
 def base_dir():
     return BASE
 
 
+def _resource_path(name):
+    """先找 exe 同级，再找打包资源目录（onefile 解压出的 _MEIPASS）。"""
+    for d in (BASE, getattr(sys, "_MEIPASS", None)):
+        if not d:
+            continue
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(BASE, name)
+
+
 def local_version():
-    # 打包后 version.txt 可能只随资源打进 _internal（exe 同级那份用于更新时覆盖），
-    # 两处都找一下，避免显示 0.0.0。
-    candidates = [os.path.join(BASE, "version.txt")]
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(os.path.join(meipass, "version.txt"))
-    for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                text = fh.read().strip()
-                if text:
-                    return text
-        except Exception:
-            pass
-    return "0.0.0"
+    try:
+        with open(_resource_path("version.txt"), "r", encoding="utf-8") as fh:
+            return fh.read().strip() or "0.0.0"
+    except Exception:
+        return "0.0.0"
+
+
+def help_text():
+    """返回内嵌的使用说明全文（供界面「使用说明」窗口显示）。"""
+    try:
+        with open(_resource_path(HELP_FILE), "r", encoding="utf-8") as fh:
+            return fh.read()
+    except Exception as exc:
+        return "（使用说明读取失败：%s）" % exc
 
 
 def parse_version(text):
@@ -79,15 +81,33 @@ def compare_version(a, b):
     return (va > vb) - (va < vb)
 
 
+def _asset_from_release(data):
+    """从 release 数据里挑可更新的资产：优先 .exe，退回 .zip（兼容旧版）。"""
+    assets = data.get("assets") or []
+    for name, url in _iter_assets(assets, ".exe"):
+        return name, url, "exe"
+    for name, url in _iter_assets(assets, ".zip"):
+        return name, url, "zip"
+    return "", "", ""
+
+
+def _iter_assets(assets, suffix):
+    hits = [(a.get("name") or "", a.get("browser_download_url") or "")
+            for a in assets
+            if (a.get("name") or "").lower().endswith(suffix)]
+    hits.sort(key=lambda x: (0 if re.search(r"win64|win", x[0], re.I) else 1))
+    return hits
+
+
 def check_latest(timeout=12):
     """访问 GitHub API，返回 dict：
     ok, local, latest, has_update, notes, published_at, page,
-    asset_name, asset_url, error
+    asset_name, asset_url, asset_kind, error
     """
     local = local_version()
     out = {"ok": False, "local": local, "latest": "", "has_update": False,
            "notes": "", "published_at": "", "page": RELEASES_PAGE,
-           "asset_name": "", "asset_url": "", "error": ""}
+           "asset_name": "", "asset_url": "", "asset_kind": "", "error": ""}
     try:
         req = urllib.request.Request(API_LATEST, headers={
             "User-Agent": "gas-doc-checker/%s" % local,
@@ -100,13 +120,8 @@ def check_latest(timeout=12):
         out["notes"] = data.get("body") or ""
         out["published_at"] = (data.get("published_at") or "")[:10]
         out["page"] = data.get("html_url") or RELEASES_PAGE
-        assets = [a for a in (data.get("assets") or [])
-                  if (a.get("name") or "").lower().endswith(".zip")]
-        # 优先带 win/windows 字样的整包，其次第一个 zip
-        assets.sort(key=lambda a: (0 if re.search(r"win", a["name"], re.I) else 1))
-        if assets:
-            out["asset_name"] = assets[0].get("name") or ""
-            out["asset_url"] = assets[0].get("browser_download_url") or ""
+        name, url, kind = _asset_from_release(data)
+        out["asset_name"], out["asset_url"], out["asset_kind"] = name, url, kind
         out["has_update"] = bool(out["latest"]) and compare_version(out["latest"], local) > 0
         out["ok"] = True
     except urllib.error.HTTPError as exc:
@@ -121,13 +136,14 @@ def check_latest(timeout=12):
     return out
 
 
-def download_release(url, on_progress=None, timeout=180):
-    """把 Release 的 zip 下载到 _tmp/update/，返回本地路径。"""
+def download_release(url, on_progress=None, timeout=300):
+    """下载资产到 _tmp/update/，文件名按扩展名命名，返回本地路径。"""
     if not url:
-        raise RuntimeError("这个版本没有提供 zip 整包，只能去网页手动下载")
+        raise RuntimeError("这个版本没有提供可下载的更新文件，只能去网页手动下载")
+    ext = ".exe" if url.lower().split("?")[0].endswith(".exe") else ".zip"
     dst_dir = os.path.join(BASE, "_tmp", "update")
     os.makedirs(dst_dir, exist_ok=True)
-    dst = os.path.join(dst_dir, "release.zip")
+    dst = os.path.join(dst_dir, "release" + ext)
     req = urllib.request.Request(url, headers={"User-Agent": "gas-doc-checker-updater"})
     with urllib.request.urlopen(req, timeout=timeout) as resp, open(dst, "wb") as fh:
         total = 0
@@ -152,46 +168,51 @@ def download_release(url, on_progress=None, timeout=180):
     return dst
 
 
-def _zip_root(names):
-    """如果 zip 里所有内容都在同一个顶层目录下，返回该目录名，否则返回 ''。"""
-    firsts = set()
-    for name in names:
-        name = name.replace("\\", "/").lstrip("/")
-        if name:
-            firsts.add(name.split("/")[0])
-    if len(firsts) == 1:
-        only = next(iter(firsts))
-        for name in names:
-            if name.replace("\\", "/").lstrip("/").split("/")[0] != only:
-                return ""
-        return only if any("/" in n for n in names if n) else ""
-    return ""
-
-
-def prepare_update(zip_path, tag):
-    """解压 zip 并生成替换脚本，返回 (bat路径, 说明字符串)。
-    校验包里必须有可执行文件或源码入口，避免拿错包把程序弄坏。
-    """
-    work = os.path.join(BASE, "_tmp", "update")
-    stage = os.path.join(work, "new")
-    if os.path.isdir(stage):
-        shutil.rmtree(stage, ignore_errors=True)
-    os.makedirs(stage, exist_ok=True)
+def _find_exe_in_zip(zip_path, stage):
+    """兼容旧版 zip 整包：解压并找出里面的 exe（或 ui.py+check.py）。"""
     with zipfile.ZipFile(zip_path) as zf:
         names = zf.namelist()
-        root = _zip_root(names)
+        firsts = set(n.replace("\\", "/").lstrip("/").split("/")[0] for n in names if n)
+        root = ""
+        if len(firsts) == 1:
+            only = next(iter(firsts))
+            if all(n.replace("\\", "/").lstrip("/").split("/")[0] == only for n in names):
+                root = only if any("/" in n for n in names if n) else ""
         zf.extractall(stage)
     src = os.path.join(stage, root) if root else stage
-    if not (os.path.isfile(os.path.join(src, EXE_NAME))
-            or (os.path.isfile(os.path.join(src, "ui.py"))
-                and os.path.isfile(os.path.join(src, "check.py")))):
-        raise RuntimeError("这个 zip 不像程序整包（里面没有 %s 或 ui.py+check.py），已取消更新" % EXE_NAME)
+    exe = os.path.join(src, EXE_NAME)
+    if os.path.isfile(exe):
+        return exe
+    return None
+
+
+def prepare_update(asset_path, tag):
+    """校验下载的文件，生成替换脚本，返回 (bat路径, 说明字符串)。
+
+    单文件版只做一件事：用新 exe 覆盖旧 exe。
+    兼容旧 zip：从 zip 里取出 exe 再替换。
+    """
+    if asset_path.lower().endswith(".zip"):
+        work = os.path.join(BASE, "_tmp", "update")
+        stage = os.path.join(work, "new")
+        if os.path.isdir(stage):
+            shutil.rmtree(stage, ignore_errors=True)
+        os.makedirs(stage, exist_ok=True)
+        new_exe = _find_exe_in_zip(asset_path, stage)
+        if not new_exe:
+            raise RuntimeError("这个 zip 里没有 %s，已取消更新" % EXE_NAME)
+    else:
+        new_exe = asset_path
+        with open(new_exe, "rb") as fh:
+            if fh.read(2) != b"MZ":
+                raise RuntimeError("下载的文件不是有效的 exe，已取消更新")
+
+    target = os.path.join(BASE, EXE_NAME) if getattr(sys, "frozen", False) else sys.executable
+    if not os.path.isfile(target):
+        raise RuntimeError("找不到当前程序 %s，已取消更新" % target)
 
     pid = os.getpid()
-    frozen = bool(getattr(sys, "frozen", False))
-    pyexe = sys.executable if not frozen else ""
-
-    # bat 放到系统临时目录，避免它自己所在的文件夹被改名/删除
+    # bat 放到系统临时目录，避免被更新流程影响
     fd, bat = tempfile.mkstemp(prefix="gasdoc_update_", suffix=".bat")
     os.close(fd)
     q = lambda s: '"%s"' % s.replace('"', '""')
@@ -204,25 +225,16 @@ def prepare_update(zip_path, tag):
         'tasklist /FI "PID eq %d" 2>NUL | findstr /I /C:"%d" >NUL' % (pid, pid),
         "if not errorlevel 1 (ping -n 2 127.0.0.1 >NUL & goto wait)",
         "ping -n 2 127.0.0.1 >NUL",
-    ]
-    for name in MANAGED_DIRS:
-        lines.append('if exist %s rmdir /S /Q %s' % (q(os.path.join(BASE, name)),
-                                                     q(os.path.join(BASE, name))))
-    for name in MANAGED_FILES:
-        lines.append('if exist %s del /F /Q %s' % (q(os.path.join(BASE, name)),
-                                                   q(os.path.join(BASE, name))))
-    lines += [
-        'xcopy /E /Y /R /H /I %s %s >NUL' % (q(os.path.join(src, "*")), q(BASE + os.sep)),
-    ]
-    if frozen:
-        lines.append('if exist %s start "" %s' % (q(os.path.join(BASE, EXE_NAME)),
-                                                  q(os.path.join(BASE, EXE_NAME))))
-    elif pyexe:
-        lines.append('start "" %s %s' % (q(pyexe), q(os.path.join(BASE, "ui.py"))))
-    lines += [
+        'copy /Y /B %s %s >NUL' % (q(new_exe), q(target)),
+        "if errorlevel 1 goto fail",
+        'start "" %s' % q(target),
         "echo 更新完成，窗口将在几秒后关闭。",
         "ping -n 4 127.0.0.1 >NUL",
         'del /F /Q "%~f0" >NUL 2>&1',
+        "goto :eof",
+        ":fail",
+        "echo 替换失败：旧程序可能被占用，请手动把新 exe 拷到程序目录。",
+        "pause",
     ]
     with open(bat, "w", encoding="utf-8") as fh:
         fh.write("\r\n".join(lines) + "\r\n")

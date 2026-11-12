@@ -48,7 +48,7 @@ from System.Windows.Forms import (                    # noqa: E402
     Form, Button, TextBox, Label, ListView, ColumnHeader, View, Application,
     FormBorderStyle, FormStartPosition, MessageBox, DialogResult, Panel,
     CharacterCasing, FlatStyle, ColumnHeaderAutoResizeStyle,
-    MessageBoxButtons, MessageBoxIcon)
+    MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle)
 from System.Drawing import Font, FontStyle, Color, Size, Point   # noqa: E402
 
 FONT = Font("Microsoft YaHei UI", 10)
@@ -138,10 +138,14 @@ class App(object):
         self.btn_update.Click += self.on_update
         f.Controls.Add(self.btn_update)
 
+        self.btn_help = mk_button("使用说明", 736, 18, 112, 30, None, bold=False)
+        self.btn_help.Click += self.on_help
+        f.Controls.Add(self.btn_help)
+
         self.lbl_version = Label()
         self.lbl_version.Text = "v%s" % updater.local_version()
         self.lbl_version.ForeColor = Color.Gray
-        self.lbl_version.Location = Point(786, 24)
+        self.lbl_version.Location = Point(666, 24)
         self.lbl_version.Size = Size(66, 20)
         f.Controls.Add(self.lbl_version)
 
@@ -223,6 +227,27 @@ class App(object):
                 self.start(code, d.FileName)
         except Exception:
             self.say("选文件出错：%s" % traceback.format_exc(limit=1), LEVEL_COLOR["错误"])
+
+    # ------------------------------------------------------------ 使用说明
+    def on_help(self, sender, args):
+        dlg = Form()
+        dlg.Text = "使用说明"
+        dlg.ClientSize = Size(760, 620)
+        dlg.StartPosition = FormStartPosition.CenterScreen
+        dlg.FormBorderStyle = FormBorderStyle.FixedSingle
+        dlg.MaximizeBox = False
+        dlg.Font = FONT
+        txt = TextBox()
+        txt.Multiline = True
+        txt.ReadOnly = True
+        txt.ScrollBars = ScrollBars.Both
+        txt.WordWrap = False
+        txt.Dock = DockStyle.Fill
+        txt.Font = Font("Microsoft YaHei UI", 10)
+        txt.Text = updater.help_text()
+        txt.SelectionStart = 0
+        dlg.Controls.Add(txt)
+        dlg.ShowDialog(self.form)
 
     # ------------------------------------------------------------ 检查更新
     def _ui(self, fn):
