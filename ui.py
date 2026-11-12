@@ -17,6 +17,7 @@ sys.path.insert(0, BASE)
 os.chdir(BASE)
 
 import updater                                          # noqa: E402
+import feedback                                         # noqa: E402
 
 # ---------------------------------------------------------------- 无界面模式
 if "--worker-check" in sys.argv:
@@ -48,7 +49,7 @@ from System.Windows.Forms import (                    # noqa: E402
     Form, Button, TextBox, Label, ListView, ColumnHeader, View, Application,
     FormBorderStyle, FormStartPosition, MessageBox, DialogResult, Panel,
     CharacterCasing, FlatStyle, ColumnHeaderAutoResizeStyle,
-    MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle)
+    MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle, ComboBox)
 from System.Drawing import Font, FontStyle, Color, Size, Point   # noqa: E402
 
 FONT = Font("Microsoft YaHei UI", 10)
@@ -86,6 +87,9 @@ class App(object):
         self.result = None
         self.fixing = False
         self.updating = False
+        # 供「反馈」自动附带：最近一次操作的上下文
+        self.context = {"code": "", "action": "（还没进行操作）", "detail": "",
+                        "status": "", "time": ""}
         self.build()
 
     # ------------------------------------------------------------ 界面
@@ -142,10 +146,14 @@ class App(object):
         self.btn_help.Click += self.on_help
         f.Controls.Add(self.btn_help)
 
+        self.btn_feedback = mk_button("反馈", 676, 18, 54, 30, None, bold=False)
+        self.btn_feedback.Click += self.on_feedback
+        f.Controls.Add(self.btn_feedback)
+
         self.lbl_version = Label()
         self.lbl_version.Text = "v%s" % updater.local_version()
         self.lbl_version.ForeColor = Color.Gray
-        self.lbl_version.Location = Point(666, 24)
+        self.lbl_version.Location = Point(606, 24)
         self.lbl_version.Size = Size(66, 20)
         f.Controls.Add(self.lbl_version)
 
@@ -215,6 +223,19 @@ class App(object):
     def say(self, text, color=None):
         self.status.Text = text
         self.status.ForeColor = color or Color.Gray
+        self.context["status"] = text
+
+    def set_context(self, code=None, action=None, detail=None):
+        """记录最近操作，供「反馈」自动附带。"""
+        if code is not None:
+            self.context["code"] = code
+        elif hasattr(self, "txt") and self.txt is not None:
+            self.context["code"] = (self.txt.Text or "").strip().upper()
+        if action is not None:
+            self.context["action"] = action
+            self.context["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if detail is not None:
+            self.context["detail"] = detail
 
     def on_pick_file(self, sender, args):
         try:
@@ -224,6 +245,7 @@ class App(object):
             if d.ShowDialog(self.form) == DialogResult.OK:
                 code = os.path.basename(d.FileName).split("-")[0]
                 self.txt.Text = code
+                self.set_context(code=code, action="选文件", detail=d.FileName)
                 self.start(code, d.FileName)
         except Exception:
             self.say("选文件出错：%s" % traceback.format_exc(limit=1), LEVEL_COLOR["错误"])
@@ -249,6 +271,96 @@ class App(object):
         dlg.Controls.Add(txt)
         dlg.ShowDialog(self.form)
 
+    # ------------------------------------------------------------ 反馈
+    def on_feedback(self, sender, args):
+        dlg = Form()
+        dlg.Text = "意见反馈"
+        dlg.ClientSize = Size(560, 460)
+        dlg.StartPosition = FormStartPosition.CenterScreen
+        dlg.FormBorderStyle = FormBorderStyle.FixedSingle
+        dlg.MaximizeBox = False
+        dlg.Font = FONT
+
+        lbl1 = Label()
+        lbl1.Text = "反馈类型"
+        lbl1.Location = Point(20, 18)
+        lbl1.Size = Size(80, 24)
+        dlg.Controls.Add(lbl1)
+
+        combo = ComboBox()
+        combo.Location = Point(100, 14)
+        combo.Size = Size(180, 28)
+        combo.DropDownStyle = 0          # DropDownList
+        for item in ("问题", "建议", "其他"):
+            combo.Items.Add(item)
+        combo.SelectedIndex = 0
+        dlg.Controls.Add(combo)
+
+        lbl2 = Label()
+        lbl2.Text = "反馈内容（必填）"
+        lbl2.Location = Point(20, 52)
+        lbl2.Size = Size(200, 24)
+        dlg.Controls.Add(lbl2)
+
+        body = TextBox()
+        body.Multiline = True
+        body.Location = Point(20, 78)
+        body.Size = Size(520, 210)
+        body.ScrollBars = ScrollBars.Vertical
+        body.Font = Font("Microsoft YaHei UI", 10)
+        dlg.Controls.Add(body)
+
+        lbl3 = Label()
+        lbl3.Text = "联系方式（选填，方便回复你）"
+        lbl3.Location = Point(20, 298)
+        lbl3.Size = Size(300, 24)
+        dlg.Controls.Add(lbl3)
+
+        contact = TextBox()
+        contact.Location = Point(20, 324)
+        contact.Size = Size(520, 28)
+        dlg.Controls.Add(contact)
+
+        tip = Label()
+        tip.Text = "匿名提交到 GitHub，无需登录；提交后可在仓库 Issues 里看到。"
+        tip.ForeColor = Color.Gray
+        tip.Location = Point(20, 360)
+        tip.Size = Size(520, 22)
+        dlg.Controls.Add(tip)
+
+        btn_send = mk_button("提交反馈", 20, 392, 110, 34, BLUE)
+        btn_cancel = mk_button("取消", 142, 392, 80, 34, None, bold=False)
+        dlg.Controls.Add(btn_send)
+        dlg.Controls.Add(btn_cancel)
+        btn_cancel.Click += lambda s, a: dlg.Close()
+
+        def do_send(s, a):
+            kind = str(combo.Text or "其他")
+            text = body.Text or ""
+            if not text.strip():
+                MessageBox.Show(dlg, "请先写点反馈内容", "意见反馈",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                return
+            btn_send.Enabled = False
+            btn_send.Text = "提交中…"
+
+            def work():
+                ok, msg = feedback.submit(kind, text, contact.Text or "",
+                                          context=dict(self.context))
+                def back():
+                    btn_send.Enabled = True
+                    btn_send.Text = "提交反馈"
+                    MessageBox.Show(dlg, msg, "意见反馈",
+                                    MessageBoxButtons.OK,
+                                    MessageBoxIcon.Information if ok else MessageBoxIcon.Error)
+                    if ok:
+                        dlg.Close()
+                self._ui(back)
+            threading.Thread(target=work, daemon=True).start()
+        btn_send.Click += do_send
+
+        dlg.ShowDialog(self.form)
+
     # ------------------------------------------------------------ 检查更新
     def _ui(self, fn):
         try:
@@ -261,6 +373,7 @@ class App(object):
             return
         self.updating = True
         self.btn_update.Enabled = False
+        self.set_context(action="检查更新", detail="查询 GitHub Releases 最新版本")
         self.say("正在检查 GitHub 上的新版本…", BLUE)
         threading.Thread(target=self._check_update_worker, daemon=True).start()
 
@@ -364,6 +477,9 @@ class App(object):
         if self.proc is not None and self.proc.poll() is None:
             self.say("上一次还在跑，稍等…", LEVEL_COLOR["警告"])
             return
+        self.set_context(code=code,
+                         action="自动修正" if do_fix else "开始检查",
+                         detail=("指定文件：%s" % path) if path else "按编号用 Everything 搜索")
         self.list.Items.Clear()
         self.result = None
         self.lbl_file.Text = ""
@@ -423,6 +539,7 @@ class App(object):
         if not data or not data.get("ok"):
             msg = (data or {}).get("error") or "未知错误"
             self.say(msg.split("\n")[0][:80], LEVEL_COLOR["错误"])
+            self.set_context(detail="操作失败：" + msg.split("\n")[0][:120])
             if (data or {}).get("kind") == "business":
                 tip = (msg + "\n\n"
                        "可以点「选文件…」直接指定那份 docx；\n"
@@ -435,6 +552,9 @@ class App(object):
         self.result = data
         counts = data.get("counts") or {}
         err, warn, info = counts.get("错误", 0), counts.get("警告", 0), counts.get("提示", 0)
+        self.set_context(
+            detail="检查完成：错误 %d / 警告 %d / 提示 %d；文件：%s"
+                   % (err, warn, info, data.get("path") or "-"))
         self.lbl_file.Text = data.get("path", "")
         self.list.BeginUpdate()
         for item in data.get("findings") or []:
