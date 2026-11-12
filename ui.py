@@ -19,6 +19,14 @@ os.chdir(BASE)
 import updater                                          # noqa: E402
 import feedback                                         # noqa: E402
 
+if "--version" in sys.argv:
+    # 便于离线核验打包进 exe 的真实版本号（不影响正常 GUI 运行）
+    try:
+        print("version", updater.local_version())
+    except Exception:
+        print("version unknown")
+    sys.exit(0)
+
 # ---------------------------------------------------------------- 无界面模式
 if "--worker-check" in sys.argv:
     _i = sys.argv.index("--worker-check")
