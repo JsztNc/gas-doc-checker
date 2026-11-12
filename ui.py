@@ -1,0 +1,475 @@
+# -*- coding: utf-8 -*-
+"""线上资料检查 —— 原生窗口版（WinForms，无网页内核）。
+
+输入工程编号 → 自动用 Everything 找「<编号>-b.线上资料.docx」→ 对照规范检查 → 列问题。
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import traceback
+
+BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                                      else os.path.abspath(__file__)))
+sys.path.insert(0, BASE)
+os.chdir(BASE)
+
+import updater                                          # noqa: E402
+
+# ---------------------------------------------------------------- 无界面模式
+if "--worker-check" in sys.argv:
+    _i = sys.argv.index("--worker-check")
+    _code, _out = sys.argv[_i + 1], sys.argv[_i + 2]
+    _rest = sys.argv[_i + 3:]
+    _path = _rest[_rest.index("--path") + 1] if "--path" in _rest else None
+    _fix = "--fix" in _rest
+    try:
+        import check as _check
+        _check.run(_code, path=_path, json_out=_out, quiet=True, do_fix=_fix)
+    except BaseException:
+        with open(_out, "w", encoding="utf-8") as fh:
+            json.dump({"ok": False, "error": traceback.format_exc(limit=2)}, fh, ensure_ascii=False)
+    sys.exit(0)
+
+import clr                                            # noqa: E402
+import System                                         # noqa: E402
+clr.AddReference("System.Windows.Forms")
+clr.AddReference("System.Drawing")
+from System.Windows.Forms import (                    # noqa: E402
+    Form, Button, TextBox, Label, ListView, ColumnHeader, View, Application,
+    FormBorderStyle, FormStartPosition, MessageBox, DialogResult, Panel,
+    CharacterCasing, FlatStyle, ColumnHeaderAutoResizeStyle,
+    MessageBoxButtons, MessageBoxIcon)
+from System.Drawing import Font, FontStyle, Color, Size, Point   # noqa: E402
+
+FONT = Font("Microsoft YaHei UI", 10)
+FONT_B = Font("Microsoft YaHei UI", 10, FontStyle.Bold)
+FONT_T = Font("Microsoft YaHei UI", 15, FontStyle.Bold)
+BLUE = Color.FromArgb(23, 119, 255)
+LEVEL_COLOR = {"错误": Color.FromArgb(214, 48, 48),
+               "警告": Color.FromArgb(214, 132, 0),
+               "提示": Color.FromArgb(120, 126, 136)}
+
+
+def mk_button(text, x, y, w, h, color=None, bold=True):
+    b = Button()
+    b.Text = text
+    b.Location = Point(x, y)
+    b.Size = Size(w, h)
+    b.Font = FONT_B if bold else FONT
+    b.FlatStyle = FlatStyle.Flat
+    if color is not None:
+        b.BackColor = color
+        b.ForeColor = Color.White
+    return b
+
+
+def open_path(path):
+    try:
+        os.startfile(path)          # noqa: S606
+    except Exception:
+        pass
+
+
+class App(object):
+    def __init__(self):
+        self.proc = None
+        self.result = None
+        self.fixing = False
+        self.updating = False
+        self.build()
+
+    # ------------------------------------------------------------ 界面
+    def build(self):
+        f = Form()
+        f.Text = "线上资料检查"
+        f.ClientSize = Size(1000, 640)
+        f.StartPosition = FormStartPosition.CenterScreen
+        f.FormBorderStyle = FormBorderStyle.FixedSingle
+        f.MaximizeBox = False
+        f.Font = FONT
+        self.form = f
+
+        title = Label()
+        title.Text = "线上燃气竣工资料检查"
+        title.Font = FONT_T
+        title.Location = Point(16, 14)
+        title.Size = Size(420, 34)
+        f.Controls.Add(title)
+
+        sub = Label()
+        sub.Text = "按《线上燃气竣工资料填写规范与校验要点》自动比对"
+        sub.ForeColor = Color.Gray
+        sub.Location = Point(20, 50)
+        sub.Size = Size(460, 20)
+        f.Controls.Add(sub)
+
+        lbl = Label()
+        lbl.Text = "工程编号"
+        lbl.Location = Point(20, 84)
+        lbl.Size = Size(72, 26)
+        f.Controls.Add(lbl)
+
+        self.txt = TextBox()
+        self.txt.Location = Point(94, 80)
+        self.txt.Size = Size(220, 28)
+        self.txt.Font = Font("Consolas", 11)
+        self.txt.CharacterCasing = CharacterCasing.Upper
+        f.Controls.Add(self.txt)
+
+        self.btn = mk_button("开始检查", 326, 78, 110, 32, BLUE)
+        self.btn.Click += self.on_check
+        f.Controls.Add(self.btn)
+
+        self.btn_file = mk_button("选文件…", 444, 78, 88, 32, None, bold=False)
+        self.btn_file.Click += self.on_pick_file
+        f.Controls.Add(self.btn_file)
+
+        self.btn_update = mk_button("检查更新", 856, 18, 118, 30, None, bold=False)
+        self.btn_update.Click += self.on_update
+        f.Controls.Add(self.btn_update)
+
+        self.lbl_version = Label()
+        self.lbl_version.Text = "v%s" % updater.local_version()
+        self.lbl_version.ForeColor = Color.Gray
+        self.lbl_version.Location = Point(786, 24)
+        self.lbl_version.Size = Size(66, 20)
+        f.Controls.Add(self.lbl_version)
+
+        self.status = Label()
+        self.status.Text = "输入工程编号（如 NC23A005），回车即开始"
+        self.status.ForeColor = Color.Gray
+        self.status.Location = Point(544, 84)
+        self.status.Size = Size(430, 24)
+        f.Controls.Add(self.status)
+
+        self.list = ListView()
+        self.list.View = View.Details
+        self.list.FullRowSelect = True
+        self.list.GridLines = False
+        self.list.HideSelection = False
+        self.list.Location = Point(16, 124)
+        self.list.Size = Size(966, 452)
+        self.list.Font = FONT
+        self.list.Columns.Add("级别", 60)
+        self.list.Columns.Add("检查项", 180)
+        self.list.Columns.Add("问题说明", 700)
+        f.Controls.Add(self.list)
+
+        self.lbl_file = Label()
+        self.lbl_file.Text = ""
+        self.lbl_file.ForeColor = Color.Gray
+        self.lbl_file.Location = Point(16, 588)
+        self.lbl_file.Size = Size(516, 22)
+        f.Controls.Add(self.lbl_file)
+
+        self.btn_fix = mk_button("自动修正", 636, 584, 104, 30, Color.FromArgb(23, 161, 90))
+        self.btn_fix.Click += self.on_fix
+        f.Controls.Add(self.btn_fix)
+
+        self.btn_open = mk_button("打开文档", 536, 584, 92, 30, None, bold=False)
+        self.btn_open.Click += lambda s, a: open_path(self.result["path"]) if self.result else None
+        f.Controls.Add(self.btn_open)
+
+        self.btn_report = mk_button("打开报告", 748, 584, 92, 30, None, bold=False)
+        self.btn_report.Click += lambda s, a: open_path(self.result["report"]) if self.result else None
+        f.Controls.Add(self.btn_report)
+
+        self.btn_folder = mk_button("报告文件夹", 846, 584, 92, 30, None, bold=False)
+        self.btn_folder.Click += lambda s, a: open_path(os.path.join(BASE, "检查报告"))
+        f.Controls.Add(self.btn_folder)
+
+        self.txt.KeyDown += self.on_key
+        f.AcceptButton = self.btn
+        f.Icon = self.load_icon()
+        return f
+
+    def load_icon(self):
+        try:
+            from System.Drawing import Icon as DIcon
+            p = os.path.join(BASE, "icon.ico")
+            if os.path.isfile(p):
+                return DIcon(p)
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------ 事件
+    def on_key(self, sender, args):
+        if args.KeyCode == 13:
+            self.on_check(None, None)
+
+    def say(self, text, color=None):
+        self.status.Text = text
+        self.status.ForeColor = color or Color.Gray
+
+    def on_pick_file(self, sender, args):
+        try:
+            from System.Windows.Forms import OpenFileDialog
+            d = OpenFileDialog()
+            d.Filter = "线上资料 (*.docx)|*.docx"
+            if d.ShowDialog(self.form) == DialogResult.OK:
+                code = os.path.basename(d.FileName).split("-")[0]
+                self.txt.Text = code
+                self.start(code, d.FileName)
+        except Exception:
+            self.say("选文件出错：%s" % traceback.format_exc(limit=1), LEVEL_COLOR["错误"])
+
+    # ------------------------------------------------------------ 检查更新
+    def _ui(self, fn):
+        try:
+            self.form.BeginInvoke(System.Action(fn))
+        except Exception:
+            pass
+
+    def on_update(self, sender, args):
+        if self.updating:
+            return
+        self.updating = True
+        self.btn_update.Enabled = False
+        self.say("正在检查 GitHub 上的新版本…", BLUE)
+        threading.Thread(target=self._check_update_worker, daemon=True).start()
+
+    def _check_update_worker(self):
+        try:
+            info = updater.check_latest()
+        except BaseException as exc:
+            info = {"ok": False, "error": str(exc)}
+        self._ui(lambda: self._update_checked(info))
+
+    def _update_checked(self, info):
+        self.btn_update.Enabled = True
+        self.updating = False
+        if not info.get("ok"):
+            msg = info.get("error") or "未知错误"
+            self.say("检查更新失败：%s" % msg.split("\n")[0][:64], LEVEL_COLOR["错误"])
+            ask = "检查更新失败：%s\n\n是否打开 releases 页面自己看看？" % msg
+            if MessageBox.Show(self.form, ask, "检查更新",
+                               MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes:
+                updater.open_releases()
+            return
+        if not info.get("has_update"):
+            self.say("已是最新版本 v%s" % info["local"], Color.FromArgb(23, 161, 90))
+            MessageBox.Show(self.form, "当前已是最新版本 v%s。" % info["local"],
+                            "检查更新", MessageBoxButtons.OK, MessageBoxIcon.Information)
+            return
+        notes = (info.get("notes") or "").strip()
+        if len(notes) > 480:
+            notes = notes[:480] + " …"
+        msg = "发现新版本 v%s（当前 v%s，发布于 %s）\n\n" % (
+            info["latest"], info["local"], info.get("published_at") or "-")
+        if notes:
+            msg += "更新说明：\n%s\n\n" % notes
+        if info.get("asset_url"):
+            msg += "是否现在下载并自动更新？\n（程序会关闭几秒，然后重新打开；检查报告不会动）"
+        else:
+            msg += "这个版本没有提供 zip 整包，只能去 releases 页面手动下载。"
+        if MessageBox.Show(self.form, msg, "发现新版本",
+                           MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes:
+            return
+        if info.get("asset_url"):
+            self._download_and_apply(info)
+        else:
+            updater.open_releases()
+
+    def _download_and_apply(self, info):
+        self.updating = True
+        self.btn_update.Enabled = False
+        self.say("正在下载 v%s…" % info["latest"], BLUE)
+
+        def progress(done, total):
+            txt = ("%d%%" % (done * 100 // total)) if total else ("%d KB" % (done // 1024))
+            self._ui(lambda: self.say("正在下载 v%s… %s" % (info["latest"], txt), BLUE))
+
+        def work():
+            try:
+                path = updater.download_release(info["asset_url"], on_progress=progress)
+                bat, tip = updater.prepare_update(path, info["latest"])
+                updater.start_update(bat)
+                self._ui(lambda: self.say(tip, Color.FromArgb(23, 161, 90)))
+                self._ui(lambda: Application.Exit())
+            except BaseException as exc:
+                err = "更新失败：%s" % exc
+                self._ui(lambda: self.say(err.split("\n")[0][:80], LEVEL_COLOR["错误"]))
+                self._ui(lambda: MessageBox.Show(self.form, err, "更新失败",
+                                                 MessageBoxButtons.OK, MessageBoxIcon.Error))
+                self._ui(lambda: setattr(self.btn_update, "Enabled", True))
+                self.updating = False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_check(self, sender, args):
+        code = (self.txt.Text or "").strip().upper()
+        if not code:
+            self.say("先输入工程编号", LEVEL_COLOR["错误"])
+            return
+        self.start(code, None)
+
+    def on_fix(self, sender, args):
+        if self.proc is not None and self.proc.poll() is None:
+            self.say("上一次还在跑，稍等…", LEVEL_COLOR["警告"])
+            return
+        path = (self.result or {}).get("path")
+        code = (self.txt.Text or "").strip().upper()
+        if not path and not code:
+            MessageBox.Show(self.form, "先输入工程编号并检查一次，再点自动修正", "自动修正")
+            return
+        ask = ("将按规范自动修正这份资料：\n\n"
+               "· 单据编号：去掉空格、按工序重排流水、消除重复\n"
+               "· 项目人员信息表：把特种工名单补齐\n\n"
+               "原文件会先备份到同目录「_改前备份」文件夹。要开始吗？")
+        if MessageBox.Show(self.form, ask, "自动修正",
+                           MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes:
+            return
+        if code:
+            self.start(code, path, do_fix=True)
+        else:
+            self.say("先输入工程编号", LEVEL_COLOR["错误"])
+
+    def start(self, code, path, do_fix=False):
+        if self.proc is not None and self.proc.poll() is None:
+            self.say("上一次还在跑，稍等…", LEVEL_COLOR["警告"])
+            return
+        self.list.Items.Clear()
+        self.result = None
+        self.lbl_file.Text = ""
+        self.btn.Enabled = False
+        self.fixing = do_fix
+        self.say("正在按规范修正…（改完会自动重新检查）" if do_fix
+                 else "正在用 Everything 搜索并解析文档…（大文件要十几秒）", BLUE)
+        out = os.path.join(BASE, "_tmp")
+        os.makedirs(out, exist_ok=True)
+        self.json_path = os.path.join(out, "check_%s.json" % code)
+        if os.path.exists(self.json_path):
+            try:
+                os.remove(self.json_path)
+            except OSError:
+                pass
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--worker-check", code, self.json_path]
+        else:
+            cmd = [sys.executable, os.path.join(BASE, "check.py"), code, "--json", self.json_path]
+        if path:
+            cmd += ["--path", path]
+        if do_fix:
+            cmd.append("--fix")
+        try:
+            self.proc = subprocess.Popen(cmd, cwd=BASE, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            self.say("启动检查进程失败：%s" % exc, LEVEL_COLOR["错误"])
+            self.btn.Enabled = True
+            return
+        threading.Thread(target=self.wait, daemon=True).start()
+
+    def wait(self):
+        t0 = time.time()
+        while self.proc.poll() is None:
+            time.sleep(0.3)
+            if time.time() - t0 > 300:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+                break
+        time.sleep(0.2)
+        data = None
+        try:
+            with open(self.json_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {"ok": False, "error": "检查进程没有返回结果（可能崩溃了）"}
+        try:
+            self.form.BeginInvoke(System.Action(lambda: self.done(data)))
+        except Exception:
+            pass
+
+    def done(self, data):
+        self.btn.Enabled = True
+        if not data or not data.get("ok"):
+            msg = (data or {}).get("error") or "未知错误"
+            self.say(msg.split("\n")[0][:80], LEVEL_COLOR["错误"])
+            MessageBox.Show(self.form, msg, "检查没成功")
+            return
+        self.result = data
+        counts = data.get("counts") or {}
+        err, warn, info = counts.get("错误", 0), counts.get("警告", 0), counts.get("提示", 0)
+        self.lbl_file.Text = data.get("path", "")
+        self.list.BeginUpdate()
+        for item in data.get("findings") or []:
+            lv = item.get("level", "")
+            row = self.list.Items.Add(lv)
+            row.SubItems.Add(item.get("rule", ""))
+            row.SubItems.Add(item.get("msg", ""))
+            row.ForeColor = LEVEL_COLOR.get(lv, Color.Black)
+        self.list.EndUpdate()
+        if err:
+            self.say("错误 %d 条，警告 %d 条 —— 先改错误项" % (err, warn), LEVEL_COLOR["错误"])
+        elif warn:
+            self.say("没有错误，警告 %d 条" % warn, LEVEL_COLOR["警告"])
+        else:
+            self.say("没发现明显问题（提示 %d 条）" % info, Color.FromArgb(23, 161, 90))
+        self.list.Columns[2].Width = 700
+        if getattr(self, "fixing", False) and data.get("fix"):
+            fx = data["fix"]
+            self.fixing = False
+            who = "、".join(x[0] for x in fx.get("people") or []) or "无"
+            MessageBox.Show(self.form,
+                            "已自动修正：\n\n"
+                            "· 单据编号 %d 处（去空格、重排流水、消除重复）\n"
+                            "· 补充人员 %d 人（%s）\n\n"
+                            "改前备份：%s" % (fx.get("codes", 0), fx.get("members", 0), who,
+                                         fx.get("backup") or "-"),
+                            "自动修正完成", MessageBoxButtons.OK, MessageBoxIcon.Information)
+
+
+def main():
+    Application.EnableVisualStyles()
+    app = App()
+    if "--demo" in sys.argv:                      # 截图/演示用假数据
+        app.txt.Text = "NC23A005"
+        app.done({"ok": True, "path": r"Z://工作文件//2025//竣工资料更改//第二批//NC23A005-b.线上资料.docx",
+                  "counts": {"错误": 3, "警告": 2, "提示": 1},
+                  "findings": [
+                      {"level": "错误", "rule": "工序时间倒流", "msg": "隐蔽（2024-08-20 15:41）早于 连接/焊接完成（2024-08-25 14:29）"},
+                      {"level": "错误", "rule": "米数对不上", "msg": "镀锌 d50：核销单 90 米，竣工验收单写 54 米"},
+                      {"level": "错误", "rule": "单据编号带空格", "msg": "「沟槽回填检查记录」里编号写成「NC23A005GX0 009」"},
+                      {"level": "警告", "rule": "汇总次数对不上", "msg": "汇总表「PE管电熔检查记录」写 1 次；前面明细 35 条、单据 35 个"},
+                      {"level": "警告", "rule": "证件已过期", "msg": "沈克成（电工）证件 赣W012023279011 已于 2025-12-04 过期"},
+                      {"level": "提示", "rule": "竣工审批不是最后", "msg": "「服务商材料使用量单」审批晚于竣工验收审批"}]})
+    if "--code" in sys.argv:
+        _code = sys.argv[sys.argv.index("--code") + 1]
+        app.txt.Text = _code
+        app.form.Shown += lambda s, a: app.start(_code, None)
+    if "--shot" in sys.argv:
+        _png = sys.argv[sys.argv.index("--shot") + 1]
+        _delay = 2.5
+        if "--shot-delay" in sys.argv:
+            _delay = float(sys.argv[sys.argv.index("--shot-delay") + 1])
+
+        def _snap():
+            from System.Drawing import Bitmap, Rectangle
+            time.sleep(_delay)
+            bmp = Bitmap(app.form.Width, app.form.Height)
+            app.form.DrawToBitmap(bmp, Rectangle(0, 0, app.form.Width, app.form.Height))
+            bmp.Save(_png)
+            for f in list(Application.OpenForms):
+                f.Close()
+
+        _th = threading.Thread(target=_snap, daemon=True)
+        app.form.Shown += lambda s, a: _th.start()
+    Application.Run(app.form)
+
+
+if __name__ == "__main__":
+    try:
+        import System.Threading as _ST
+        _t = _ST.Thread(_ST.ThreadStart(main))
+        _t.SetApartmentState(_ST.ApartmentState.STA)    # 文件夹/文件对话框需要 STA
+        _t.Start()
+        _t.Join()
+    except Exception:
+        traceback.print_exc()
+        main()
