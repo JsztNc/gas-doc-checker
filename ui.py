@@ -346,6 +346,12 @@ class App(object):
             feedback._dbg("do_send enter (UI thread)")
             kind = str(combo.Text or "其他")
             text = body.Text or ""
+            # 关键：所有控件值都在【UI 线程】这里读好，作为普通字符串传入后台线程。
+            # 绝不能在后台线程里再访问 WinForms 控件（如 contact.Text）——那会触发
+            # WinForms 跨线程控件访问，Release 模式下把读取同步 marshal 回 UI 线程，
+            # 而此刻 UI 线程往往还卡在 do_send 内没回到消息泵，造成双方死锁 + 窗口「未响应」。
+            contact_text = contact.Text or ""
+            ctx = dict(self.context)
             if not text.strip():
                 MessageBox.Show(dlg, "请先写点反馈内容", "意见反馈",
                                 MessageBoxButtons.OK, MessageBoxIcon.Information)
@@ -362,7 +368,7 @@ class App(object):
                 feedback._dbg("thread started")
                 try:
                     result["ok"], result["msg"] = feedback.submit(
-                        kind, text, contact.Text or "", context=dict(self.context))
+                        kind, text, contact_text, context=ctx)
                 except Exception as exc:
                     result["ok"], result["msg"] = False, "提交失败：%s" % exc
                 feedback._dbg("thread done ok=%s" % result.get("ok"))
