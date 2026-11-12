@@ -21,6 +21,7 @@ import datetime
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -37,6 +38,19 @@ ISSUES_PAGE = "https://github.com/%s/issues?q=label%%3Auser-feedback" % GITHUB_R
 # 改为从同目录的 feedback_token.txt 读取；该文件已 gitignore，打包时作为
 # 资源嵌进 exe。只在开发者本机的源码目录里才有这个 txt。
 TOKEN_FILE = "feedback_token.txt"
+
+
+def _dbg(msg):
+    """把反馈流程关键节点写入 BASE/_tmp/feedback_debug.log，便于定位卡死问题。
+    任何异常都被吞掉，绝不影响主流程。"""
+    try:
+        d = os.path.join(BASE, "_tmp")
+        os.makedirs(d, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:12]
+        with open(os.path.join(d, "feedback_debug.log"), "a", encoding="utf-8") as fh:
+            fh.write("%s  %s\n" % (ts, msg))
+    except Exception:
+        pass
 
 
 def _load_token():
@@ -81,6 +95,8 @@ def submit(kind, content, contact="", context=None):
     content = (content or "").strip()
     if not content:
         return False, "反馈内容不能为空"
+    _dbg("submit called: kind=%s len=%d" % (kind, len(content)))
+    t0 = time.time()
 
     title = "%s %s - %s" % (
         TITLE_PREFIX,
@@ -128,8 +144,10 @@ def submit(kind, content, contact="", context=None):
         "X-GitHub-Api-Version": "2022-11-28",
     })
     try:
+        _dbg("submit: urlopen begin")
         with urllib.request.urlopen(req, timeout=20) as resp:
             result = json.loads(resp.read().decode("utf-8", "replace"))
+        _dbg("submit: ok elapsed=%.2fs" % (time.time() - t0))
         url = result.get("html_url") or ISSUES_PAGE
         return True, "反馈已提交，谢谢！可在 GitHub 查看：%s" % url
     except urllib.error.HTTPError as exc:
@@ -139,8 +157,10 @@ def submit(kind, content, contact="", context=None):
             detail = err.get("message") or ""
         except Exception:
             pass
+        _dbg("submit: HTTPError %s elapsed=%.2fs" % (exc.code, time.time() - t0))
         return False, "提交失败（HTTP %s）：%s" % (exc.code, detail or "请稍后重试")
     except Exception as exc:
+        _dbg("submit: exception %s elapsed=%.2fs" % (exc, time.time() - t0))
         return False, "提交失败：%s" % exc
 
 

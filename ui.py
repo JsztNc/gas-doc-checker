@@ -274,7 +274,7 @@ class App(object):
     # ------------------------------------------------------------ 反馈
     def on_feedback(self, sender, args):
         dlg = Form()
-        dlg.Text = "意见反馈"
+        dlg.Text = "意见反馈 (v%s)" % updater.local_version()
         dlg.ClientSize = Size(560, 460)
         dlg.StartPosition = FormStartPosition.CenterScreen
         dlg.FormBorderStyle = FormBorderStyle.FixedSingle
@@ -335,6 +335,7 @@ class App(object):
         btn_cancel.Click += lambda s, a: dlg.Close()
 
         def do_send(s, a):
+            feedback._dbg("do_send enter (UI thread)")
             kind = str(combo.Text or "其他")
             text = body.Text or ""
             if not text.strip():
@@ -350,17 +351,21 @@ class App(object):
             result = {}
 
             def work():
+                feedback._dbg("thread started")
                 try:
                     result["ok"], result["msg"] = feedback.submit(
                         kind, text, contact.Text or "", context=dict(self.context))
                 except Exception as exc:
                     result["ok"], result["msg"] = False, "提交失败：%s" % exc
+                feedback._dbg("thread done ok=%s" % result.get("ok"))
             threading.Thread(target=work, daemon=True).start()
+            feedback._dbg("thread launched, UI thread returned")
 
             def tick(sender, ev):
                 if not result:                 # 后台还没返回
                     return
                 timer.Stop()
+                feedback._dbg("tick fired, showing result")
                 if dlg.IsDisposed or not dlg.IsHandleCreated:
                     return                     # 用户已关掉对话框，不再弹窗
                 btn_send.Enabled = True
