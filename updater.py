@@ -40,8 +40,9 @@ def base_dir():
 
 
 def _resource_path(name):
-    """先找 exe 同级，再找打包资源目录（onefile 解压出的 _MEIPASS）。"""
-    for d in (BASE, getattr(sys, "_MEIPASS", None)):
+    """优先用打包资源目录（onefile 解压出的 _MEIPASS，反映 exe 内嵌真实版本），
+    再回退到 exe 同级目录。这样版本号不会被源码目录里那份 version.txt 掩盖。"""
+    for d in (getattr(sys, "_MEIPASS", None), BASE):
         if not d:
             continue
         p = os.path.join(d, name)
