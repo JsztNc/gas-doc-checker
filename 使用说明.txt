@@ -81,6 +81,11 @@ Q: 提示「没找到 es.exe」
 A: 程序目录下 bin\es.exe 被删了。重新拷一份回去（Everything 官网的 ES 命令行工具），
    或把 Everything 装在默认路径也行（程序会自动找 C:\Program Files\Everything）。
 
+Q: 双击 exe 直接闪退，或弹「Failed to resolve Python.Runtime.Loader.Initialize」
+A: 程序是从网盘/邮件下载的，Windows 给文件打了「来自网络」标记，把 _internal
+   里的 DLL 锁住了。双击「解除网络标记.bat」再重新打开即可（一次就行）。
+   也可手动：右键程序文件夹 → 属性 → 勾选「解除锁定」→ 确定。
+
 Q: 结果里某条看着不对
 A: 报告里的判断都带原始数值（比如「汇总表写 3 次；明细 63 条、单据 63 个」），
    对着数字看一眼就知道是资料错了还是口径特殊。

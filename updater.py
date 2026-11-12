@@ -48,11 +48,21 @@ def base_dir():
 
 
 def local_version():
-    try:
-        with open(VERSION_FILE, "r", encoding="utf-8") as fh:
-            return fh.read().strip()
-    except Exception:
-        return "0.0.0"
+    # 打包后 version.txt 可能只随资源打进 _internal（exe 同级那份用于更新时覆盖），
+    # 两处都找一下，避免显示 0.0.0。
+    candidates = [os.path.join(BASE, "version.txt")]
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "version.txt"))
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read().strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+    return "0.0.0"
 
 
 def parse_version(text):

@@ -50,6 +50,14 @@ python check.py NC23A005
 自动更新只替换程序自带文件（`_internal/`、`checker/`、`bin/`、各 `.py/.bat/.exe`、
 `version.txt`、使用说明），**不会动 `检查报告/` 和用户自己放进去的文件**。
 
+## 从网盘下载后闪退 / 报 Python.Runtime.Loader.Initialize
+
+Windows 会给从网盘或邮件下载的文件打上"来自网络"标记（Zone.Identifier），
+.NET 会拒绝加载带这个标记的 DLL，导致程序一启动就崩溃。
+
+**解决**：双击目录下的 `解除网络标记.bat`，然后重新打开程序（一次即可）。
+或手动：右键程序文件夹 → 属性 → 勾选"解除锁定" → 确定。
+
 ## 自动更新原理
 
 `updater.py` 只用 Python 标准库：
