@@ -90,7 +90,7 @@ Windows 会给从网盘或邮件下载的文件打上"来自网络"标记（Zone
 
 `updater.py` 只用 Python 标准库：
 
-1. `GET https://api.github.com/repos/lonyii/gas-doc-checker/releases/latest`
+1. `GET https://api.github.com/repos/JsztNc/gas-doc-checker/releases/latest`
 2. 比较 `tag_name` 与内嵌的 `version.txt`
 3. 有新版则下载 Release 里的 `.exe` 资产到 `_tmp/update/`，校验 MZ 头
 4. 在系统临时目录生成一个 bat：等主程序退出 → 用新 exe 覆盖旧 exe → 重启

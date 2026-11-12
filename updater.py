@@ -28,7 +28,7 @@ import zipfile
 BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
                                       else os.path.abspath(__file__)))
 
-GITHUB_REPO = "lonyii/gas-doc-checker"
+GITHUB_REPO = "JsztNc/gas-doc-checker"
 API_LATEST = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
 RELEASES_PAGE = "https://github.com/%s/releases" % GITHUB_REPO
 EXE_NAME = "线上资料检查.exe"

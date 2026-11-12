@@ -27,7 +27,7 @@ import urllib.request
 BASE = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False)
                                       else os.path.abspath(__file__)))
 
-GITHUB_REPO = "lonyii/gas-doc-checker"
+GITHUB_REPO = "JsztNc/gas-doc-checker"
 API_ISSUES = "https://api.github.com/repos/%s/issues" % GITHUB_REPO
 ISSUES_PAGE = "https://github.com/%s/issues?q=label%%3Auser-feedback" % GITHUB_REPO
 
