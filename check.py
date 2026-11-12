@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""按工程编号自动找「<编号>-b.线上资料.docx」并对照规范检查。
+"""按工程编号自动找「<编号>-线上资料.docx / .pdf」并对照规范检查。
 
 用法：
     python check.py NC23A005
-    python check.py ID25E021 --path "D:\\某项目\\ID25E021-b.线上资料.docx"
+    python check.py ID25E021 --path "D:\\某项目\\ID25E021-线上资料.docx"
+    python check.py IE25E001 --path "D:\\某项目\\IE25E001-线上资料.pdf"
     python check.py IE25E001 --html          # 另存一份 html 报告
 """
 import argparse
@@ -98,7 +99,7 @@ def run(code, path=None, prefer=0, html_out=False, quiet=False, json_out=None,
             raise RuntimeError(err)
         if not hits:
             raise RuntimeError(
-                "没搜到「%s-b.线上资料.docx」。\n"
+                "没搜到「%s」相关的 线上资料.docx / .pdf。\n"
                 "可能原因：编号写错、Everything 没开着、或文件所在的共享盘没连上。"
                 % code)
         order = list(range(prefer, len(hits))) + list(range(0, prefer))
@@ -170,7 +171,7 @@ def run(code, path=None, prefer=0, html_out=False, quiet=False, json_out=None,
 def main():
     ap = argparse.ArgumentParser(description="线上燃气竣工资料自动检查")
     ap.add_argument("code", help="工程编号，如 NC23A005")
-    ap.add_argument("--path", help="直接指定 docx 路径，跳过 Everything 搜索")
+    ap.add_argument("--path", help="直接指定 docx/pdf 路径，跳过 Everything 搜索")
     ap.add_argument("--pick", type=int, default=0, help="多个同名文件时取第几个（从 0 开始，按修改时间新→旧）")
     ap.add_argument("--html", action="store_true", help="额外输出 html 版报告")
     ap.add_argument("--json", dest="json_out", help="把结果写成 json（界面调用用）")

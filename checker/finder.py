@@ -56,7 +56,11 @@ def _run_export(query, out_csv):
 
 
 def find(code, tmpdir=None):
-    """返回 (候选列表, 错误信息)。候选按「修改时间新→路径短」排序。"""
+    """返回 (候选列表, 错误信息)。候选按「修改时间新→路径短」排序。
+
+    同时接受 .docx 与 .pdf 两种资料格式，文件名兼容
+    「<编号>-b.线上资料」与「<编号>-线上资料」两种写法。
+    """
     code = (code or "").strip().upper()
     if not code:
         return [], "工程编号为空"
@@ -64,28 +68,28 @@ def find(code, tmpdir=None):
     os.makedirs(tmpdir, exist_ok=True)
     out = os.path.join(tmpdir, "es_%s.csv" % code.replace("/", "_"))
 
-    want = "%s-b.线上资料.docx" % code
-    rows, err = _run_export(want, out)
+    def _keep(r):
+        name = os.path.basename(r["path"]).lower()
+        ext = os.path.splitext(name)[1]
+        return (ext in (".docx", ".pdf")
+                and code.lower() in name
+                and "线上资料" in name)
+
+    # 主搜索：<编号> 线上资料（不限扩展名），再按文件名过滤
+    rows, err = _run_export("%s 线上资料" % code, out)
     if err:
         return [], err
-
-    hits = []
-    for r in rows:
-        name = os.path.basename(r["path"]).lower()
-        if name == want.lower():
-            hits.append(r)
-    if not hits:                       # 编号带后缀差异时放宽：含编号 + 线上资料 + b
-        for r in rows:
-            name = os.path.basename(r["path"]).lower()
-            if code.lower() in name and "线上资料" in name and name.endswith(".docx"):
-                hits.append(r)
+    hits = [r for r in rows if _keep(r)]
     if not hits:
-        rows2, err2 = _run_export("%s 线上资料 ext:docx" % code, out)
+        # 兜底：精确名（含 -b. 写法），兼容老命名 / 共享盘索引差异
+        rows2, err2 = _run_export("%s-b.线上资料" % code, out)
         if not err2:
-            for r in rows2:
-                name = os.path.basename(r["path"]).lower()
-                if code.lower() in name and "线上资料" in name:
-                    hits.append(r)
+            hits = [r for r in rows2 if _keep(r)]
+
+    if not hits:
+        return [], ("没搜到「%s」相关的 线上资料.docx / .pdf。\n"
+                    "可能原因：编号写错、Everything 没开着、或文件所在的共享盘没连上。"
+                    % code)
 
     def rank(r):
         return (r["mtime"] or "", -len(r["path"]))

@@ -329,10 +329,18 @@ def build_bills(items):
     return bills
 
 
+def _read_items(path):
+    """按扩展名选解析器：PDF 走 pdf_reader，其余走 docx_reader 自带解析。"""
+    if path.lower().endswith(".pdf"):
+        from checker import pdf_reader
+        return pdf_reader.read_items(path)
+    return read_items(path)
+
+
 class Doc(object):
     def __init__(self, path):
         self.path = path
-        self.items = read_items(path)
+        self.items = _read_items(path)
         self.bills = build_bills(self.items)
         self.meta = self._meta()
 

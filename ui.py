@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """线上资料检查 —— 原生窗口版（WinForms，无网页内核）。
 
-输入工程编号 → 自动用 Everything 找「<编号>-b.线上资料.docx」→ 对照规范检查 → 列问题。
+输入工程编号 → 自动用 Everything 找「<编号>-线上资料.docx / .pdf」→ 对照规范检查 → 列问题。
 """
 import json
 import os
@@ -249,7 +249,7 @@ class App(object):
         try:
             from System.Windows.Forms import OpenFileDialog
             d = OpenFileDialog()
-            d.Filter = "线上资料 (*.docx)|*.docx"
+            d.Filter = "线上资料 (*.docx;*.pdf)|*.docx;*.pdf"
             if d.ShowDialog(self.form) == DialogResult.OK:
                 code = os.path.basename(d.FileName).split("-")[0]
                 self.txt.Text = code
@@ -585,7 +585,7 @@ class App(object):
             self.set_context(detail="操作失败：" + msg.split("\n")[0][:120])
             if (data or {}).get("kind") == "business":
                 tip = (msg + "\n\n"
-                       "可以点「选文件…」直接指定那份 docx；\n"
+                       "可以点「选文件…」直接指定那份 docx / pdf；\n"
                        "或确认：编号没写错、Everything 在运行、共享盘已连上。")
                 MessageBox.Show(self.form, tip, "检查没成功",
                                 MessageBoxButtons.OK, MessageBoxIcon.Information)
