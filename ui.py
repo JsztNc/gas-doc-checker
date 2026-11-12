@@ -28,9 +28,16 @@ if "--worker-check" in sys.argv:
     try:
         import check as _check
         _check.run(_code, path=_path, json_out=_out, quiet=True, do_fix=_fix)
+    except RuntimeError as exc:
+        # 预期内的业务错误（没搜到文件、文件打不开等）只回传消息本身，
+        # 不把 traceback 弹给用户。
+        with open(_out, "w", encoding="utf-8") as fh:
+            json.dump({"ok": False, "error": str(exc), "kind": "business"},
+                      fh, ensure_ascii=False)
     except BaseException:
         with open(_out, "w", encoding="utf-8") as fh:
-            json.dump({"ok": False, "error": traceback.format_exc(limit=2)}, fh, ensure_ascii=False)
+            json.dump({"ok": False, "error": traceback.format_exc(limit=3), "kind": "crash"},
+                      fh, ensure_ascii=False)
     sys.exit(0)
 
 import clr                                            # noqa: E402
@@ -391,7 +398,14 @@ class App(object):
         if not data or not data.get("ok"):
             msg = (data or {}).get("error") or "未知错误"
             self.say(msg.split("\n")[0][:80], LEVEL_COLOR["错误"])
-            MessageBox.Show(self.form, msg, "检查没成功")
+            if (data or {}).get("kind") == "business":
+                tip = (msg + "\n\n"
+                       "可以点「选文件…」直接指定那份 docx；\n"
+                       "或确认：编号没写错、Everything 在运行、共享盘已连上。")
+                MessageBox.Show(self.form, tip, "检查没成功",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+            else:
+                MessageBox.Show(self.form, msg, "检查出错")
             return
         self.result = data
         counts = data.get("counts") or {}

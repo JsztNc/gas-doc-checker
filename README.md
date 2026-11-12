@@ -50,6 +50,11 @@ python check.py NC23A005
 自动更新只替换程序自带文件（`_internal/`、`checker/`、`bin/`、各 `.py/.bat/.exe`、
 `version.txt`、使用说明），**不会动 `检查报告/` 和用户自己放进去的文件**。
 
+## 版本记录
+
+- **v1.0.1**：没搜到文件时不再弹出技术堆栈，改为干净提示并引导「选文件…」；源码模块全部打进 exe，脱离源码目录也能运行。
+- **v1.0.0**：首版，含线上资料检查、自动修正、检查更新按钮。
+
 ## 从网盘下载后闪退 / 报 Python.Runtime.Loader.Initialize
 
 Windows 会给从网盘或邮件下载的文件打上"来自网络"标记（Zone.Identifier），

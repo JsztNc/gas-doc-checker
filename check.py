@@ -97,8 +97,10 @@ def run(code, path=None, prefer=0, html_out=False, quiet=False, json_out=None,
         if err:
             raise RuntimeError(err)
         if not hits:
-            raise RuntimeError("没搜到 %s-b.线上资料.docx（Everything 里没有这个文件，"
-                               "确认编号是否正确、那台电脑是否在共享里）" % code)
+            raise RuntimeError(
+                "没搜到「%s-b.线上资料.docx」。\n"
+                "可能原因：编号写错、Everything 没开着、或文件所在的共享盘没连上。"
+                % code)
         order = list(range(prefer, len(hits))) + list(range(0, prefer))
         path = None
         for i in order:                       # 同名副本可能有打不开的，逐个试
