@@ -358,7 +358,13 @@ class App(object):
                 except Exception as exc:
                     result["ok"], result["msg"] = False, "提交失败：%s" % exc
                 feedback._dbg("thread done ok=%s" % result.get("ok"))
-            threading.Thread(target=work, daemon=True).start()
+            # 关键：必须用 .NET 原生线程（System.Threading.Thread），不能用 Python 的
+            # threading.Thread。从 WinForms 回调里起 threading.Thread 会触发 pythonnet 的
+            # GIL 死锁——主线程卡死（界面「未响应」），新线程也永远拿不到 GIL，work() 根本不执行。
+            # 本项目 main 入口（见文件末尾）同样用 System.Threading.Thread 规避此问题。
+            _th = System.Threading.Thread(System.Threading.ThreadStart(work))
+            _th.IsBackground = True
+            _th.Start()
             feedback._dbg("thread launched, UI thread returned")
 
             def tick(sender, ev):
