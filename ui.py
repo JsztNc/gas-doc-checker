@@ -49,7 +49,7 @@ from System.Windows.Forms import (                    # noqa: E402
     Form, Button, TextBox, Label, ListView, ColumnHeader, View, Application,
     FormBorderStyle, FormStartPosition, MessageBox, DialogResult, Panel,
     CharacterCasing, FlatStyle, ColumnHeaderAutoResizeStyle,
-    MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle, ComboBox)
+    MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle, ComboBox, ComboBoxStyle)
 from System.Drawing import Font, FontStyle, Color, Size, Point   # noqa: E402
 
 FONT = Font("Microsoft YaHei UI", 10)
@@ -290,7 +290,7 @@ class App(object):
         combo = ComboBox()
         combo.Location = Point(100, 14)
         combo.Size = Size(180, 28)
-        combo.DropDownStyle = 0          # DropDownList
+        combo.DropDownStyle = ComboBoxStyle.DropDownList
         for item in ("问题", "建议", "其他"):
             combo.Items.Add(item)
         combo.SelectedIndex = 0
