@@ -2,12 +2,14 @@
 """发布到局域网共享目录（客户端「检查更新」优先走这条路）。
 
 用法（在仓库根目录）：
-    python 发布到局域网.py --src dist_v144\\stage --version 1.4.4
-    python 发布到局域网.py --src dist_v144\\stage --version 1.4.4 --manifest-only
+    python 发布到局域网.py --src dist_v145\\stage --version 1.4.5
+    python 发布到局域网.py --src dist_v145\\stage --version 1.4.5 --incremental
+    python 发布到局域网.py --src dist_v145\\stage --version 1.4.5 --manifest-only
 
 做三件事：
 1. 生成 files.json（相对路径 → 大小/md5，客户端只读它做比对，避免逐文件读共享）
-2. 把整个程序目录拷到共享（--manifest-only 时跳过拷贝，只补清单/版本标记）
+2. 把整个程序目录拷到共享（--manifest-only 只补清单/版本标记，不拷文件；
+   --incremental 按旧清单 md5 比对，只拷变动文件——共享写入很慢时用它，通常只几十秒）
 3. 写 version.txt（无 BOM）与可选的 更新说明.txt
 
 前提：当前 Windows 会话已能访问共享（资源管理器打开过或 net use 过）。
@@ -28,14 +30,50 @@ def write_text(path, text):
         fh.write(text)
 
 
+def copy_incremental(src, dest):
+    """按共享上的旧 files.json 比对 md5，只拷有变动/新增的文件。返回 (拷了, 跳过)。"""
+    old = {}
+    try:
+        with open(os.path.join(dest, updater.LAN_MANIFEST), "r", encoding="utf-8") as fh:
+            old = (json.load(fh).get("files") or {})
+    except Exception:
+        old = {}
+    copied = skipped = 0
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in ("_tmp", "检查报告", "_改前备份", "__pycache__")]
+        for name in files:
+            sp = os.path.join(root, name)
+            rel = os.path.relpath(sp, src)
+            ent = old.get(rel) or {}
+            try:
+                same = (ent.get("md5") == updater._md5(sp)
+                        and ent.get("size") == os.path.getsize(sp))
+            except Exception:
+                same = False
+            if same:
+                skipped += 1
+                continue
+            tp = os.path.join(dest, rel)
+            parent = os.path.dirname(tp)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            shutil.copy2(sp, tp)
+            copied += 1
+            if copied % 50 == 0:
+                print("  已拷 %d 个…" % copied, flush=True)
+    return copied, skipped
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True, help="待发布的程序目录（dist_vXXX\\stage）")
-    ap.add_argument("--version", required=True, help="版本号，如 1.4.4")
+    ap.add_argument("--version", required=True, help="版本号，如 1.4.5")
     ap.add_argument("--dest", default=updater.LAN_ROOT, help="目标共享目录")
     ap.add_argument("--note", default="", help="更新说明文字（可不填）")
     ap.add_argument("--manifest-only", action="store_true",
                     help="只写清单/版本标记，不拷贝程序文件")
+    ap.add_argument("--incremental", action="store_true",
+                    help="只拷 md5 有变动的文件（共享写入慢时用，比全量快得多）")
     args = ap.parse_args()
 
     src = os.path.abspath(args.src)
@@ -46,8 +84,12 @@ def main():
     if not os.path.isdir(args.dest):
         raise SystemExit("目标共享目录不可访问：%s" % args.dest)
 
-    if not args.manifest_only:
-        print("拷贝 %s -> %s …" % (src, args.dest))
+    if args.incremental:
+        print("增量拷贝 %s -> %s …" % (src, args.dest))
+        copied, skipped = copy_incremental(src, args.dest)
+        print("增量完成：拷了 %d 个，跳过未变 %d 个" % (copied, skipped))
+    elif not args.manifest_only:
+        print("全量拷贝 %s -> %s …" % (src, args.dest))
         shutil.copytree(src, args.dest, dirs_exist_ok=True)
         print("拷贝完成")
 

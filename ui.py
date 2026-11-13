@@ -18,6 +18,7 @@ os.chdir(BASE)
 
 import updater                                          # noqa: E402
 import feedback                                         # noqa: E402
+import device                                           # noqa: E402  V1.4.5 设备登记
 
 if "--version" in sys.argv:
     # 便于离线核验打包进 exe 的真实版本号（不影响正常 GUI 运行）
@@ -105,7 +106,7 @@ class App(object):
     # ------------------------------------------------------------ 界面
     def build(self):
         f = Form()
-        f.Text = "线上资料检查"
+        f.Text = "线上资料检查 — %s" % device.device_name()   # V1.4.5 标题栏显示本机设备名
         f.ClientSize = Size(1000, 640)
         f.StartPosition = FormStartPosition.CenterScreen
         f.FormBorderStyle = FormBorderStyle.FixedSingle
@@ -876,9 +877,54 @@ class App(object):
         dlg.ShowDialog(self.form)
 
 
+def register_device(app):
+    """启动时把本机设备名上报信息平台（首次自动授权）。
+
+    · 后台线程做网络请求，回来后切回 UI 线程处理
+    · 只有平台明确回「已停用/已过期」才拦；断网、云端故障一律放行
+    """
+    def work():
+        info = device.register(updater.local_version())
+
+        def back():
+            if info.get("blocked"):
+                try:
+                    app.say("本机使用权限已被停用", LEVEL_COLOR["错误"])
+                except Exception:
+                    pass
+                MessageBox.Show(
+                    app.form,
+                    "本机（%s）的使用权限已被管理员停用，程序将退出。\n\n"
+                    "设备ID：%s\n\n"
+                    "如需恢复使用，请联系管理员在信息平台「设备管理」里启用这台设备。"
+                    % (info.get("name") or device.device_name(), info.get("id") or device.device_id()),
+                    "无使用权限", MessageBoxButtons.OK, MessageBoxIcon.Warning)
+                Application.Exit()
+                return
+            if info.get("ok") and info.get("first"):
+                try:
+                    app.say("首次使用：本机（%s）已自动登记授权" % (info.get("name") or ""),
+                            Color.FromArgb(23, 161, 90))
+                except Exception:
+                    pass
+
+        try:
+            app.form.BeginInvoke(System.Action(back))
+        except Exception:
+            pass
+
+    # 必须用 .NET 原生线程：pythonnet 下从 WinForms 回调起 Python threading.Thread 会 GIL 死锁
+    th = System.Threading.Thread(System.Threading.ThreadStart(work))
+    th.IsBackground = True
+    th.Start()
+
+
 def main():
     Application.EnableVisualStyles()
     app = App()
+    # V1.4.5：窗口显示后自动上报本机设备名（截图/演示模式不报，避免污染设备列表）
+    if "--demo" not in sys.argv and "--shot" not in sys.argv:
+        app.form.Shown += lambda s, a: register_device(app)
     if "--demo" in sys.argv:                      # 截图/演示用假数据
         app.txt.Text = "NC23A005"
         app.done({"ok": True, "path": r"Z://工作文件//2025//竣工资料更改//第二批//NC23A005-b.线上资料.docx",

@@ -57,8 +57,12 @@ def _platform_post(kind, content, contact="", context=None):
     if ctx.get("time"):
         lines.append("操作时间：%s" % ctx["time"])
     lines.append("版本：v%s" % version())
+    dev_name = (os.environ.get("COMPUTERNAME") or "").strip()
+    if dev_name:
+        lines.append("设备：%s" % dev_name)
     payload = {
         "app": PLATFORM_APP,
+        "device": dev_name,
         "user": (contact or "").strip() or "匿名",
         "content": "\n".join(lines),
     }

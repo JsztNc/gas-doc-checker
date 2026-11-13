@@ -34,6 +34,7 @@ exe 旁边会自动生成 `检查报告/`（历次报告）和 `_tmp/`（临时�
 | `ui.py` | WinForms 窗口界面（含使用说明、检查更新按钮） |
 | `check.py` | 检查主程序，命令行入口 |
 | `updater.py` | 自动更新：局域网共享优先（逐文件 md5 增量）→ 回退 GitHub；生成替换脚本 → 重启 |
+| `device.py` | 启动时读取本机设备名/设备ID，上报信息平台登记（首次自动授权；断网放行） |
 | `version.txt` | 当前版本号，发新版时改这里 |
 | `checker/` | 解析与规则（docx_reader / rules / finder / fixer） |
 | `bin/es.exe` | Everything 命令行搜索工具（打包时内嵌） |
