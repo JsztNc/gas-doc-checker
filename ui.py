@@ -19,6 +19,11 @@ os.chdir(BASE)
 import updater                                          # noqa: E402
 import feedback                                         # noqa: E402
 import device                                           # noqa: E402  V1.4.5 设备登记
+import preview                                          # noqa: E402  V1.5.0 截图预览 / 就地改
+try:
+    import suggest                                      # V1.5.0 程序修改建议（外挂，可直接改）
+except Exception:                                       # 单文件版里没有这个文件时兜底
+    suggest = None
 
 if "--version" in sys.argv:
     # 便于离线核验打包进 exe 的真实版本号（不影响正常 GUI 运行）
@@ -26,6 +31,29 @@ if "--version" in sys.argv:
         print("version", updater.local_version())
     except Exception:
         print("version unknown")
+    sys.exit(0)
+
+if "--preview-test" in sys.argv:
+    # 自检：验证「Word 截图」这条链路在打包版里能不能跑通
+    # 用法：线上资料检查.exe --preview-test <docx 路径> [关键字]
+    _i = sys.argv.index("--preview-test")
+    _p = sys.argv[_i + 1] if len(sys.argv) > _i + 1 else ""
+    _nk = sys.argv[_i + 2] if len(sys.argv) > _i + 2 else ""
+    _png = os.path.join(BASE, "_tmp", "preview_selftest.png")
+    os.makedirs(os.path.dirname(_png), exist_ok=True)
+    try:
+        _r = preview.render(_p, _nk, _png)
+        print(json.dumps(_r, ensure_ascii=False))
+    except Exception as _exc:                     # noqa: BLE001
+        _r = {"ok": False, "error": str(_exc)[:200]}
+        print(json.dumps(_r, ensure_ascii=False))
+    try:                                          # 打包成无控制台程序时 print 看不到，落个文件
+        with open(os.path.join(BASE, "_tmp", "preview_selftest.json"), "w",
+                  encoding="utf-8") as _fh:
+            json.dump(_r, _fh, ensure_ascii=False)
+    except Exception:
+        pass
+    preview.stop_worker()
     sys.exit(0)
 
 # ---------------------------------------------------------------- 无界面模式
@@ -60,8 +88,8 @@ from System.Windows.Forms import (                    # noqa: E402
     CharacterCasing, FlatStyle, ColumnHeaderAutoResizeStyle,
     MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle, ComboBox, ComboBoxStyle,
     DataGridView, DataGridViewSelectionMode, MouseButtons, ContextMenuStrip,
-    ToolStripMenuItem, Clipboard)
-from System.Drawing import Font, FontStyle, Color, Size, Point   # noqa: E402
+    ToolStripMenuItem, Clipboard, PictureBox, PictureBoxSizeMode, BorderStyle)
+from System.Drawing import Font, FontStyle, Color, Size, Point, Image   # noqa: E402
 
 FONT = Font("Microsoft YaHei UI", 10)
 FONT_B = Font("Microsoft YaHei UI", 10, FontStyle.Bold)
@@ -112,6 +140,7 @@ class App(object):
         f.FormBorderStyle = FormBorderStyle.FixedSingle
         f.MaximizeBox = False
         f.Font = FONT
+        f.FormClosing += lambda s, a: preview.stop_worker()   # 退出时关掉后台 Word
         self.form = f
 
         title = Label()
@@ -187,6 +216,7 @@ class App(object):
         self.list.Columns.Add("检查项", 180)
         self.list.Columns.Add("问题说明", 700)
         self.list.MouseUp += self.on_list_menu          # 问题行右键 → 快捷反馈
+        self.list.MouseDoubleClick += self.on_row_preview   # 双击问题行 → 截图预览/就地改
         f.Controls.Add(self.list)
 
         self.lbl_file = Label()
@@ -549,6 +579,296 @@ class App(object):
 
         dlg.ShowDialog(self.form)
 
+    # ---------------------------------------------------- 双击问题行：截图预览 / 就地改
+    def on_row_preview(self, sender, args):
+        """双击问题列表某一行 → 打开详情窗：文档截图 + 程序建议 + 改这一条。"""
+        if not self.result or args.Button != MouseButtons.Left:
+            return
+        it = self.list.GetItemAt(args.X, args.Y)      # 点在空白处/表头上不弹窗
+        if it is None:
+            return
+        findings = self.result.get("findings") or []
+        idx = self.list.Items.IndexOf(it)
+        if idx < 0 or idx >= len(findings):
+            return
+        self.row_preview_dialog(findings[idx], idx)
+
+    def row_preview_dialog(self, finding, row_index):
+        level = (finding or {}).get("level", "")
+        rule = (finding or {}).get("rule", "")
+        msg = (finding or {}).get("msg", "")
+        path = ((self.result or {}).get("path") or "").strip()
+        advice = (suggest.SUGGEST.get(rule, suggest.FALLBACK) if suggest
+                  else "对照规范原文核对一下这条；确认要改的，在 Word 里改完重新检查。")
+        needle = preview.needle_of(msg)
+        color = LEVEL_COLOR.get(level, Color.Black)
+
+        out_png = os.path.join(BASE, "_tmp", "preview",
+                               "p_%d_%d.png" % (os.getpid(), int(time.time() * 1000) % 1000000))
+        os.makedirs(os.path.dirname(out_png), exist_ok=True)
+
+        dlg = Form()
+        dlg.Text = "第 %d 条问题 —— 看截图 / 改这一条 (v%s)" % (row_index + 1, updater.local_version())
+        dlg.ClientSize = Size(1180, 706)
+        dlg.StartPosition = FormStartPosition.CenterScreen
+        dlg.FormBorderStyle = FormBorderStyle.FixedSingle
+        dlg.MaximizeBox = False
+        dlg.Font = FONT
+
+        # ---------------- 左：文档截图 ----------------
+        panel = Panel()
+        panel.Location = Point(16, 16)
+        panel.Size = Size(700, 600)
+        panel.AutoScroll = True
+        panel.BorderStyle = BorderStyle.FixedSingle
+        panel.BackColor = Color.White
+        dlg.Controls.Add(panel)
+
+        lbl_wait = Label()
+        lbl_wait.Text = "正在生成文档截图…（第一次要 3~5 秒）"
+        lbl_wait.Location = Point(16, 16)
+        lbl_wait.Size = Size(560, 26)
+        lbl_wait.ForeColor = Color.Gray
+        panel.Controls.Add(lbl_wait)
+
+        lbl_page = Label()
+        lbl_page.Text = ""
+        lbl_page.Location = Point(16, 622)
+        lbl_page.Size = Size(700, 24)
+        lbl_page.ForeColor = Color.Gray
+        lbl_page.Font = Font("Microsoft YaHei UI", 9)
+        dlg.Controls.Add(lbl_page)
+
+        # ---------------- 右：问题 / 建议 / 修改 ----------------
+        lbl_title = Label()
+        lbl_title.Text = "%s ｜ %s" % (level, rule)
+        lbl_title.Font = FONT_B
+        lbl_title.ForeColor = color
+        lbl_title.Location = Point(734, 12)
+        lbl_title.Size = Size(430, 26)
+        dlg.Controls.Add(lbl_title)
+
+        txt_msg = TextBox()
+        txt_msg.Multiline = True
+        txt_msg.ReadOnly = True
+        txt_msg.ScrollBars = ScrollBars.Vertical
+        txt_msg.Location = Point(734, 42)
+        txt_msg.Size = Size(430, 88)
+        txt_msg.Font = Font("Microsoft YaHei UI", 9.5)
+        txt_msg.Text = msg
+        dlg.Controls.Add(txt_msg)
+
+        lbl_adv = Label()
+        lbl_adv.Text = "程序建议这样改："
+        lbl_adv.Font = FONT_B
+        lbl_adv.Location = Point(734, 138)
+        lbl_adv.Size = Size(300, 22)
+        dlg.Controls.Add(lbl_adv)
+
+        txt_adv = TextBox()
+        txt_adv.Multiline = True
+        txt_adv.ReadOnly = True
+        txt_adv.ScrollBars = ScrollBars.Vertical
+        txt_adv.Location = Point(734, 162)
+        txt_adv.Size = Size(430, 150)
+        txt_adv.Font = Font("Microsoft YaHei UI", 9.5)
+        txt_adv.BackColor = Color.FromArgb(245, 246, 248)
+        txt_adv.Text = advice
+        dlg.Controls.Add(txt_adv)
+
+        btn_edit = mk_button("修改这条内容", 734, 322, 160, 34, BLUE)
+        btn_edit.Enabled = False          # 等截图出来、确认定位到原文之后再解锁
+        dlg.Controls.Add(btn_edit)
+
+        lbl_old = Label()
+        lbl_old.Text = "原文（文档里被定位到的那串字）"
+        lbl_old.Location = Point(734, 364)
+        lbl_old.Size = Size(400, 20)
+        dlg.Controls.Add(lbl_old)
+
+        txt_old = TextBox()
+        txt_old.Location = Point(734, 386)
+        txt_old.Size = Size(430, 28)
+        txt_old.Font = Font("Consolas", 10)
+        txt_old.ReadOnly = True
+        txt_old.BackColor = Color.FromArgb(245, 246, 248)
+        dlg.Controls.Add(txt_old)
+
+        lbl_new = Label()
+        lbl_new.Text = "改为"
+        lbl_new.Location = Point(734, 422)
+        lbl_new.Size = Size(400, 20)
+        dlg.Controls.Add(lbl_new)
+
+        txt_new = TextBox()
+        txt_new.Location = Point(734, 444)
+        txt_new.Size = Size(430, 28)
+        txt_new.Font = Font("Consolas", 10)
+        txt_new.Enabled = False
+        dlg.Controls.Add(txt_new)
+
+        lbl_hint = Label()
+        lbl_hint.Text = ""
+        lbl_hint.ForeColor = Color.Gray
+        lbl_hint.Font = Font("Microsoft YaHei UI", 9)
+        lbl_hint.Location = Point(734, 480)
+        lbl_hint.Size = Size(430, 150)
+        dlg.Controls.Add(lbl_hint)
+
+        btn_save = mk_button("保存修改", 734, 646, 130, 40, None)
+        btn_save.Enabled = False
+        dlg.Controls.Add(btn_save)
+        btn_word = mk_button("在 Word 里打开", 872, 646, 140, 40, None, bold=False)
+        dlg.Controls.Add(btn_word)
+        btn_close = mk_button("关闭", 1020, 646, 144, 40, None, bold=False)
+        dlg.Controls.Add(btn_close)
+        btn_close.Click += lambda s, a: dlg.Close()
+        btn_word.Click += lambda s, a: open_path(path) if path else None
+
+        state = {"found": needle, "can_edit": False}
+
+        # ---------------- 截图（后台线程出图，Timer 轮询） ----------------
+        def draw_preview(res):
+            if dlg.IsDisposed:
+                return
+            if not res.get("ok"):
+                lbl_wait.Text = res.get("error") or "截图失败"
+                lbl_wait.ForeColor = LEVEL_COLOR["错误"]
+                lbl_hint.Text = "没有截图也可以照着上面的建议改；或在 Word 里打开这份文件手工改。"
+                return
+            try:
+                img = Image.FromFile(res["png"])
+            except Exception as exc:
+                lbl_wait.Text = "图片打不开：%s" % exc
+                return
+            avail = panel.ClientSize.Width - 26
+            w = max(200, min(avail, img.Width))
+            h = int(img.Height * (float(w) / img.Width))
+            pb = PictureBox()
+            pb.Image = img
+            pb.SizeMode = PictureBoxSizeMode.StretchImage
+            pb.Location = Point(8, 8)
+            pb.Size = Size(w, h)
+            panel.Controls.Remove(lbl_wait)
+            panel.Controls.Add(pb)
+            state["found"] = (res.get("found") or "").strip()
+            txt_old.Text = state["found"] or needle
+            bits = []
+            if res.get("page"):
+                bits.append("第 %s 页" % res["page"])
+            if res.get("found"):
+                bits.append("已高亮：%s" % res["found"])
+            if res.get("note"):
+                bits.append(res["note"])
+            lbl_page.Text = "　".join(bits)
+            is_docx = path.lower().endswith((".docx", ".doc", ".docm"))
+            state["can_edit"] = bool(state["found"]) and is_docx
+            btn_edit.Enabled = state["can_edit"]
+            if state["can_edit"]:
+                lbl_hint.Text = "点「修改这条内容」→ 填「改为」→ 点「保存修改」。"
+            elif not is_docx:
+                lbl_hint.Text = "这份是 PDF，不能就地修改；PDF 只能看检查报告。"
+            else:
+                lbl_hint.Text = ("没能在文档里定位到具体文字（可能这段在图片、页眉或文本框里），"
+                                 "这条只能点「在 Word 里打开」手工改。")
+
+        box = preview.submit(preview.render, path, needle, out_png)
+        t1 = System.Windows.Forms.Timer()
+        t1.Interval = 250
+
+        def tick1(sender, args):
+            if "r" not in box:
+                return
+            t1.Stop()
+            draw_preview(box["r"])
+
+        t1.Tick += tick1
+        t1.Start()
+
+        # ---------------- 「修改」：只放开这一条 ----------------
+        def on_edit(sender, args):
+            if not state["can_edit"]:
+                return
+            txt_old.ReadOnly = False
+            txt_new.Enabled = True
+            btn_save.Enabled = True
+            btn_edit.Enabled = False
+            txt_new.Focus()
+            lbl_hint.Text = ("把「原文」改成你要的内容，然后点下面的「保存修改」。\n"
+                             "· 只改文字，不动字体和表格线\n"
+                             "· 这份文档里同样的字出现几次就一起改几次\n"
+                             "· 保存前会自动备份到同目录 _改前备份\\\n"
+                             "· 改完会自动重新检查一遍")
+
+        btn_edit.Click += on_edit
+
+        # ---------------- 「保存」：Word 查找替换 + 备份 ----------------
+        def on_save(sender, args):
+            old = (txt_old.Text or "").strip()
+            new = (txt_new.Text or "").strip()
+            if not old:
+                MessageBox.Show(dlg, "「原文」是空的，没法定位要改哪一处。", "保存修改",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                return
+            if not new:
+                MessageBox.Show(dlg, "还没填「改为」的内容。", "保存修改",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                return
+            if old == new:
+                MessageBox.Show(dlg, "改后和原来一样，不用保存。", "保存修改",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                return
+            if MessageBox.Show(
+                    dlg,
+                    "把文档里所有的「%s」改成「%s」？\n\n"
+                    "改前会自动备份到同目录的 _改前备份\\，只改文字不动格式。" % (old, new),
+                    "确认修改", MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question) != DialogResult.Yes:
+                return
+            btn_save.Enabled = False
+            btn_save.Text = "保存中…"
+            lbl_hint.Text = "正在写入文档，请稍等…（Word 在后台干活）"
+            box2 = preview.submit(preview.replace_all, path, old, new)
+
+            def tick2(s2, a2):
+                if "r" not in box2:
+                    return
+                t2.Stop()
+                res = box2["r"]
+                btn_save.Text = "保存修改"
+                if not res.get("ok"):
+                    btn_save.Enabled = True
+                    lbl_hint.Text = res.get("error") or "保存失败"
+                    MessageBox.Show(dlg, res.get("error") or "保存失败", "保存修改",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Error)
+                    return
+                bak = res.get("backup") or ""
+                warn = res.get("warn") or ""
+                MessageBox.Show(
+                    dlg,
+                    "已修改 %d 处并保存。\n%s%s\n现在自动重新检查一遍…"
+                    % (res.get("count", 1),
+                       ("改前备份：" + bak + "\n") if bak else "",
+                       (warn + "\n") if warn else ""),
+                    "保存成功", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                dlg.Close()
+                code = (self.txt.Text or "").strip().upper()
+                if code:
+                    self.start(code, path)
+
+            t2 = System.Windows.Forms.Timer()
+            t2.Interval = 300
+            t2.Tick += tick2
+            t2.Start()
+
+        btn_save.Click += on_save
+
+        dlg.ShowDialog(self.form)
+        try:
+            t1.Stop()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------ 检查更新
     def _ui(self, fn):
         try:
@@ -778,11 +1098,11 @@ class App(object):
             row.ForeColor = LEVEL_COLOR.get(lv, Color.Black)
         self.list.EndUpdate()
         if err:
-            self.say("错误 %d 条，警告 %d 条 —— 先改错误项；在问题行上右键可反馈" % (err, warn), LEVEL_COLOR["错误"])
+            self.say("错误 %d 条，警告 %d 条 —— 先改错误项；双击某条看截图并修改，右键可反馈" % (err, warn), LEVEL_COLOR["错误"])
         elif warn:
-            self.say("没有错误，警告 %d 条；在问题行上右键可反馈" % warn, LEVEL_COLOR["警告"])
+            self.say("没有错误，警告 %d 条；双击某条看截图并修改，右键可反馈" % warn, LEVEL_COLOR["警告"])
         else:
-            self.say("没发现明显问题（提示 %d 条）" % info, Color.FromArgb(23, 161, 90))
+            self.say("没发现明显问题（提示 %d 条）；双击某条看截图" % info, Color.FromArgb(23, 161, 90))
         self.list.Columns[2].Width = 700
         if getattr(self, "fixing", False) and data.get("fix"):
             fx = data["fix"]
