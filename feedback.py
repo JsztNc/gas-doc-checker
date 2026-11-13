@@ -139,12 +139,15 @@ def submit(kind, content, contact="", context=None):
     _dbg("submit called: kind=%s len=%d" % (kind, len(content)))
     t0 = time.time()
 
-    # V1.3.9 镜像通道：同步上报信息平台（超时 8 秒封顶），成败都不影响后续原通道
+    # 镜像通道：同步上报信息平台（超时 8 秒封顶），成败都不影响后续原通道
+    mirror_ok = False
     try:
-        _platform_post(kind, content, contact, context)
-        _dbg("platform mirror: ok elapsed=%.2fs" % (time.time() - t0))
+        mirror_ok, mirror_msg = _platform_post(kind, content, contact, context)
+        _dbg("platform mirror: ok=%s elapsed=%.2fs %s" % (mirror_ok, time.time() - t0, mirror_msg))
     except Exception as exc:
         _dbg("platform mirror failed: %s" % exc)
+    # 只要镜像通道送达，本次反馈就算提交成功（原通道失败只记日志）
+    ok_hint = "反馈已提交，谢谢！维护者会尽快查看。"
 
     title = "%s %s - %s" % (
         TITLE_PREFIX,
@@ -181,6 +184,9 @@ def submit(kind, content, contact="", context=None):
     payload = {"title": title, "body": body, "labels": [ISSUE_LABEL]}
     token = _load_token()
     if not token:
+        _dbg("no token; mirror_ok=%s" % mirror_ok)
+        if mirror_ok:
+            return True, ok_hint
         return False, "反馈功能尚未配置提交凭证，请联系程序维护者"
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -206,9 +212,13 @@ def submit(kind, content, contact="", context=None):
         except Exception:
             pass
         _dbg("submit: HTTPError %s elapsed=%.2fs" % (exc.code, time.time() - t0))
+        if mirror_ok:
+            return True, ok_hint
         return False, "提交失败（HTTP %s）：%s" % (exc.code, detail or "请稍后重试")
     except Exception as exc:
         _dbg("submit: exception %s elapsed=%.2fs" % (exc, time.time() - t0))
+        if mirror_ok:
+            return True, ok_hint
         return False, "提交失败：%s" % exc
 
 

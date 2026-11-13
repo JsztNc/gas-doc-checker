@@ -330,7 +330,7 @@ class App(object):
         dlg.Controls.Add(contact)
 
         tip = Label()
-        tip.Text = "匿名提交到 GitHub，无需登录；提交后可在仓库 Issues 里看到。"
+        tip.Text = "匿名提交，无需登录；提交后维护者会尽快查看。"
         tip.ForeColor = Color.Gray
         tip.Location = Point(20, 360)
         tip.Size = Size(520, 22)
