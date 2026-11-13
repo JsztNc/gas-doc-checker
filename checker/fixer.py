@@ -6,8 +6,9 @@ GX0006~GX0035；其余工序单据的编号混在这段号里，造成重复、�
 处理方式：
   · 焊接记录的 21 个单据号保持不变，只去掉编号里的空格（系统会把
     「NC26E365G X0019」当成另一个号）；
-  · 其余工序单据按工序先后排到 0036 之后连续编号：
-    螺纹连接 → 管道防腐 → 隐蔽工程 → 管道吹扫 → 强度试验 → 严密性试验 → 附件安装
+  · 其余工序单据从 0036 起，按出现顺序「全局连续」编号（同一工序多行、
+    跨工序都不撞号）：螺纹连接 → 管道防腐 → 隐蔽工程 → 管道吹扫 →
+    强度试验 → 严密性试验 → 附件安装
   · 所有编号统一成「项目编号GX0000」格式。
 
 只改「单据编号」格子里匹配编号格式的文本，其余内容一概不动；改前必须备份。
@@ -24,9 +25,20 @@ from .docx_reader import classify
 CODE_CELL = re.compile(r"^([A-Z]{2}\d{2}[A-Z0-9]{1,8}?)GX0*(\d+)$", re.I)
 CODE_FLAT = re.compile(r"^[A-Z]{2}\d{2}[A-Z0-9]{1,8}?GX0*\d+$", re.I)
 
-# 工序顺序 → 起始流水号（排在焊接号段之后）
+# 需要重排流水号的工序（焊接记录号段保持不变）。
+# 从 RESEQ_START 起，按表格出现顺序「全局连续」编号——同一工序多行、跨工序都不会撞号。
 ORDER = [("luowen", 36), ("fangfu", 37), ("yinbi", 38), ("chuixao", 39),
          ("qiangdu", 40), ("mishi", 41), ("fujian", 42)]
+RESEQ_START = 36
+_RESEQ_KINDS = {k for k, _ in ORDER}
+
+# 单据类型中文名（用于对比弹窗里的「位置」说明）
+_KIND_CN = {"luowen": "螺纹连接", "fangfu": "防腐", "yinbi": "隐蔽工程",
+            "chuixao": "管道吹扫", "qiangdu": "强度试验", "mishi": "严密性试验",
+            "fujian": "附件安装", "ganghan": "钢质管道焊接", "renyuan": "项目人员信息表",
+            "tezhong": "特种工登记表", "huizong": "工序质量检查汇总表",
+            "shiyan": "试验记录", "wajue": "沟槽开挖", "huitian": "沟槽回填",
+            "kaigong": "开工报告", "kaitong": "阀门/附件"}
 
 
 def _norm(s):
@@ -66,60 +78,60 @@ def _set_cell_code(cell, new_text):
     return done
 
 
-def analyze(path):
-    """dry-run：返回 [(位置说明, 旧号, 新号)]，不写文件。"""
-    doc = Document(path)
+def _plan_codes(doc):
+    """生成重排方案 [(表号0基, 行号0基, 工序kind, 编号格, 新号)]。
+
+    · 焊接记录：保留本行原号，只去掉夹在编号里的空格；
+    · 其余工序：从 RESEQ_START 起按出现顺序全局连续编号，
+      同一工序多行、跨工序都保证不撞号。
+    """
     plan = []
-    start = {k: n for k, n in ORDER}
+    seq = RESEQ_START
     for ti, tbl in enumerate(doc.tables):
         kind = _table_kind(tbl)
-        fixed = "keep" if kind == "ganghan" else start.get(kind)
-        if fixed is None:
+        if kind != "ganghan" and kind not in _RESEQ_KINDS:
             continue
-        seq = fixed if fixed != "keep" else 0
         for ri, row in enumerate(tbl.rows):
-            for ci, cell in enumerate(row.cells):
-                hit = _code_in_cell(cell)
-                if not hit:
-                    continue
-                pid, oldseq = hit
-                # 焊接：保留本行原号只去空格；其余工序：按出现顺序连续编号，不把多行压成同一个号
-                new = "%sGX%04d" % (pid, oldseq if fixed == "keep" else seq)
-                old = cell.text.strip()
-                if old != new:
-                    plan.append(("表%d %s R%dC%d" % (ti + 1, kind, ri + 1, ci + 1),
-                                 old, new))
-                if fixed != "keep":
-                    seq += 1
-                break                                 # 一行只改第一个编号格
-    return plan
-
-
-def apply(path, out_path=None):
-    """按 analyze 的方案改写。out_path 缺省就地保存。"""
-    doc = Document(path)
-    start = {k: n for k, n in ORDER}
-    changed = 0
-    for tbl in doc.tables:
-        kind = _table_kind(tbl)
-        fixed = "keep" if kind == "ganghan" else start.get(kind)
-        if fixed is None:
-            continue
-        seq = fixed if fixed != "keep" else 0
-        for row in tbl.rows:
             for cell in row.cells:
                 hit = _code_in_cell(cell)
                 if not hit:
                     continue
                 pid, oldseq = hit
-                new = "%sGX%04d" % (pid, oldseq if fixed == "keep" else seq)
-                if _set_cell_code(cell, new):
-                    changed += 1
-                if fixed != "keep":
+                if kind == "ganghan":
+                    new = "%sGX%04d" % (pid, oldseq)
+                else:
+                    new = "%sGX%04d" % (pid, seq)
                     seq += 1
-                break
+                plan.append((ti, ri, kind, cell, new))
+                break                                 # 一行只认第一个编号格
+    return plan
+
+
+def _code_loc(ti, ri, kind):
+    return "表%d %s 第%d行" % (ti + 1, _KIND_CN.get(kind, kind), ri + 1)
+
+
+def analyze(path):
+    """dry-run：返回 [(位置说明, 旧号, 新号)]，不写文件。"""
+    doc = Document(path)
+    plan = []
+    for ti, ri, kind, cell, new in _plan_codes(doc):
+        old = cell.text.strip()
+        if old != new:
+            plan.append((_code_loc(ti, ri, kind), old, new))
+    return plan
+
+
+def apply(path, out_path=None):
+    """按 analyze 的方案改写。返回 diffs = [(位置, 旧值, 新值)]。"""
+    doc = Document(path)
+    diffs = []
+    for ti, ri, kind, cell, new in _plan_codes(doc):
+        old = cell.text.strip()
+        if old != new and _set_cell_code(cell, new):
+            diffs.append((_code_loc(ti, ri, kind), old, new))
     doc.save(out_path or path)
-    return changed
+    return diffs
 
 
 # --------------------------------------------------------------------------
@@ -183,7 +195,7 @@ def add_members(path, people, out_path=None):
     seq = int(rows[last].cells[0].text.strip())
 
     prev = rows[last]._tr
-    added = 0
+    added = []
     for k, (name, role) in enumerate(people):
         tr = deepcopy(rows[last]._tr)
         prev.addnext(tr)
@@ -198,7 +210,7 @@ def add_members(path, people, out_path=None):
         for key in ("联系方式", "备注"):
             if col(key) >= 0:
                 _set_text(row.cells[col(key)], "")
-        added += 1
+        added.append((name, role))
     doc.save(out_path or path)
     return added
 
@@ -291,6 +303,35 @@ def _canonical_pid(parsed):
     return cnt.most_common(1)[0][0] if cnt else None
 
 
+# 合法工程编号形如 NC25E571 / IE25E001 / NC23E622GX0002（允许中间夹空格）
+_PID_VALUE = _re.compile(r"^[A-Z]{2}\d{2}[A-Z0-9]{0,20}$", _re.I)
+
+
+def _logical_cells(row):
+    """python-docx 对合并单元格会重复返回同一个 <w:tc>；按底层 tc 去重，
+    返回 [(列号, 单元格)]，这样「标签格 → 值格」才不会指回标签自己。"""
+    out, seen = [], set()
+    for ci, c in enumerate(row.cells):
+        key = id(c._tc)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((ci, c))
+    return out
+
+
+def _iter_pid_cells(tbl):
+    """产出 (行号, 标签文本, 值格)：每行最多认一个 项目编号/工程编号 标签。"""
+    for ri, row in enumerate(tbl.rows):
+        logical = _logical_cells(row)
+        for k, (_ci, c) in enumerate(logical):
+            label = _re.sub(r"\s+", "", c.text or "")
+            if label in ("项目编号", "工程编号"):
+                if k + 1 < len(logical):
+                    yield ri, label, logical[k + 1][1]
+                break
+
+
 def analyze_pid(path):
     """dry-run：返回 [(位置, 旧值, 新值)]，不写文件。"""
     parsed = _ParsedDoc(path)
@@ -299,62 +340,46 @@ def analyze_pid(path):
         return []
     plan = []
     for ti, tbl in enumerate(_PyDoc(path).tables):
-        for ri, row in enumerate(tbl.rows):
-            for ci, c in enumerate(row.cells):
-                if _re.sub(r"\s+", "", c.text or "") in ("项目编号", "工程编号"):
-                    if ci + 1 >= len(row.cells):
-                        continue
-                    nxt = row.cells[ci + 1]
-                    cur = _re.sub(r"\s+", "", nxt.text or "").upper()
-                    if cur and cur != pid:
-                        plan.append(("表%d R%dC%d" % (ti + 1, ri + 1, ci + 2),
-                                     nxt.text.strip(), pid))
+        for ri, label, vc in _iter_pid_cells(tbl):
+            cur = _re.sub(r"\s+", "", vc.text or "").upper()
+            if _PID_VALUE.match(cur) and cur != pid:
+                plan.append(("表%d 第%d行「%s」" % (ti + 1, ri + 1, label),
+                             vc.text.strip(), pid))
     return plan
 
 
 def apply_pid(path, out_path=None):
     pid = _canonical_pid(_ParsedDoc(path))
     if not pid:
-        return 0
+        return []
     doc = _PyDoc(path)
-    changed = 0
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for ci, c in enumerate(row.cells):
-                if _re.sub(r"\s+", "", c.text or "") in ("项目编号", "工程编号"):
-                    if ci + 1 >= len(row.cells):
-                        continue
-                    nxt = row.cells[ci + 1]
-                    cur = _re.sub(r"\s+", "", nxt.text or "").upper()
-                    if cur and cur != pid:
-                        _set_text(nxt, pid)
-                        changed += 1
+    diffs, seen = [], set()
+    for ti, tbl in enumerate(doc.tables):
+        for ri, label, vc in _iter_pid_cells(tbl):
+            cur = _re.sub(r"\s+", "", vc.text or "").upper()
+            # 只改「本来就是编号、但和主导编号不一致」的值格，绝不碰标签/名称
+            if not _PID_VALUE.match(cur) or cur == pid:
+                continue
+            key = id(vc._tc)
+            if key in seen:                 # 同一合并格可能出现在多行视图里
+                continue
+            seen.add(key)
+            old = vc.text.strip()
+            _set_text(vc, pid)
+            diffs.append(("表%d 第%d行「%s」" % (ti + 1, ri + 1, label), old, pid))
     doc.save(out_path or path)
-    return changed
+    return diffs
 
 
 def _summary_count(parsed, name):
-    """汇总表某工序名称应写的检查次数（单据张数），无匹配返回 None。"""
-    facts = _Facts(parsed)
-    name = _re.sub(r"\s+", "", name or "")
-    if "强度" in name or "严密" in name:
-        indoors = True if "室内" in name else (False if "室外" in name else None)
-        strength = "强度" in name
-        sel = [b for b in facts.all("shiyan")
-               if (indoors is None or ("室内" in b.title) == indoors)
-               and (("强度" in b.title) == strength)]
-        if not sel:
-            return None
-        return sum(len(set(_bill_codes(b))) for b in sel)
-    FIXED = [("PE管电熔", "dianrong_jc"), ("PE管热熔", "rean_jc"),
-             ("钢质管道焊接", "ganghan"), ("螺纹连接", "luowen"), ("防腐", "fangfu"),
-             ("附属设施安装", "fujian"), ("沟槽回填", "huitian"), ("沟槽开挖", "wajue"),
-             ("隐蔽", "yinbi"), ("吹扫", "chuixao")]
-    for kw, kind in FIXED:
-        if kw in name:
-            b = facts.get(kind)
-            return len(set(_bill_codes(b))) if b else None
-    return None
+    """汇总表某工序名称应写的检查次数（单据张数），无匹配返回 None。
+
+    直接复用 rules.summary_target —— 检查（r_summary）和修正用同一口径，
+    避免「检查说 3 次、修正却没改」这类漂移。
+    """
+    from .rules import summary_target
+    _level, cnt = summary_target(_Facts(parsed), name)
+    return cnt
 
 
 def analyze_summary(path):
@@ -385,8 +410,8 @@ def analyze_summary(path):
 def apply_summary(path, out_path=None):
     doc = _PyDoc(path)
     parsed = _ParsedDoc(path)
-    changed = 0
-    for tbl in doc.tables:
+    diffs = []
+    for ti, tbl in enumerate(doc.tables):
         if _table_kind(tbl) != "huizong":
             continue
         hri, nci = _find_col(tbl, "工序名称")
@@ -403,10 +428,11 @@ def apply_summary(path, out_path=None):
             if tgt is None:
                 continue
             if cur != str(tgt):
+                old = row.cells[cci].text.strip() or "（空）"
                 _set_text(row.cells[cci], str(tgt))
-                changed += 1
+                diffs.append(("表%d 汇总「%s」" % (ti + 1, name), old, str(tgt)))
     doc.save(out_path or path)
-    return changed
+    return diffs
 
 
 def analyze_note(path):
@@ -437,8 +463,8 @@ def analyze_note(path):
 
 def apply_note(path, out_path=None):
     doc = _PyDoc(path)
-    changed = 0
-    for tbl in doc.tables:
+    diffs = []
+    for ti, tbl in enumerate(doc.tables):
         k = _table_kind(tbl)
         if k not in ("qiangdu", "mishi", "shiyan"):
             continue
@@ -458,17 +484,26 @@ def apply_note(path, out_path=None):
             target = tbl.rows[hri + 1].cells[bri]
         if target is None:
             continue
+        old = target.text.strip() or "（空）"
         prefix = "；" if (target.text or "").strip() else ""
         _append_text(target, prefix + STD_NOTE)
-        changed += 1
+        diffs.append(("表%d 试验记录备注栏" % (ti + 1), old, prefix + STD_NOTE))
     doc.save(out_path or path)
-    return changed
+    return diffs
 
 
-def fix_document(path, out_path=None, backup_dir=None):
-    """备份 → 项目编号统一 → 汇总次数修正 → 发泡剂备注补全 → 重排编号 → 补人员。
+def fix_document(path, out_path=None, backup_dir=None, save_as=True):
+    """按规范自动修正，返回修改前后对比所需的全部信息。
 
-    返回 {'backup','pid','summary','note','codes','members','people'} 各组改动数。
+    默认 save_as=True：把修正结果另存为「<原名>_修正后.docx」，原文件不动；
+    仅在 save_as=False（就地覆盖）时才写一份 _改前备份。
+
+    返回 dict：
+        saved_as : 修正后文件（save_as 时即另存文件，否则等于 path）
+        original : 原始文件（未改动）
+        backup   : 就地覆盖时的备份路径（另存模式为 None）
+        diffs    : [(类别, 位置, 修改前, 修改后), ...] 用于前后对比展示
+        pid/summary/note/codes/members : 各类改动计数；people : 补充人员列表
     PDF 暂不支持写回，显式报错提示先转 Word。
     """
     import os
@@ -479,21 +514,49 @@ def fix_document(path, out_path=None, backup_dir=None):
         raise RuntimeError("自动修正目前只支持 Word(.docx)；这份是 PDF，请先用 WPS/Adobe 的"
                            "「PDF 转 Word」转成可编辑 Word 后再修正。")
 
+    if out_path:
+        target = out_path
+    elif save_as:
+        d = os.path.dirname(os.path.abspath(path))
+        base = os.path.splitext(os.path.basename(path))[0]
+        target = os.path.join(d, "%s_修正后.docx" % base)
+    else:
+        target = path
+
+    # 只有在「就地覆盖」时才需要备份；另存模式下原文件本身就是「改前」
     bak = None
-    if backup_dir is not False:
+    if target == path and backup_dir is not False:
         bdir = backup_dir or os.path.join(os.path.dirname(os.path.abspath(path)), "_改前备份")
         os.makedirs(bdir, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        base = os.path.splitext(os.path.basename(path))[0]
-        bak = os.path.join(bdir, "%s.%s.docx" % (base, stamp))
+        bbase = os.path.splitext(os.path.basename(path))[0]
+        bak = os.path.join(bdir, "%s.%s.docx" % (bbase, stamp))
         shutil.copy2(path, bak)
 
-    target = out_path or path
-    n_pid = apply_pid(path, target)
-    n_sum = apply_summary(target, target) if n_pid >= 0 else 0
-    n_note = apply_note(target, target)
-    n_codes = apply(target, target)
+    # 从原文件复制出工作副本，再在工作副本上逐步套用各项修正
+    # （就地覆盖时 target == path，不能自己拷自己）
+    if os.path.abspath(target) != os.path.abspath(path):
+        shutil.copy2(path, target)
+
+    diffs = []
+    for loc, old, new in apply_pid(target, target):
+        diffs.append(("项目编号", loc, old, new))
+    # 先规范单据编号（去空格 / 消除重复），再按改后实际张数回写汇总次数，
+    # 否则汇总目标值会按「旧的重复编号」算，与复检结果对不上。
+    for loc, old, new in apply(target, target):
+        diffs.append(("单据编号", loc, old, new))
+    for loc, old, new in apply_summary(target, target):
+        diffs.append(("汇总次数", loc, old, new))
+    for loc, old, new in apply_note(target, target):
+        diffs.append(("试验备注", loc, old, new))
+
     people = suggest_members(target)
-    n_mem = add_members(target, people) if people else 0
-    return {"backup": bak, "pid": n_pid, "summary": n_sum, "note": n_note,
-            "codes": n_codes, "members": n_mem, "people": people}
+    added = add_members(target, people) if people else []
+    for nm, role in added:
+        diffs.append(("补人员", "项目人员信息表", "（原表缺）", "%s / %s" % (nm, role)))
+
+    cnt = lambda c: sum(1 for d in diffs if d[0] == c)
+    return {"saved_as": target, "original": os.path.abspath(path), "backup": bak,
+            "diffs": diffs, "pid": cnt("项目编号"), "summary": cnt("汇总次数"),
+            "note": cnt("试验备注"), "codes": cnt("单据编号"),
+            "members": len(added), "people": people}

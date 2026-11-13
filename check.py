@@ -6,6 +6,8 @@
     python check.py ID25E021 --path "D:\\某项目\\ID25E021-线上资料.docx"
     python check.py IE25E001 --path "D:\\某项目\\IE25E001-线上资料.pdf"
     python check.py IE25E001 --html          # 另存一份 html 报告
+    python check.py NC23A005 --fix           # 自动修正 → 另存 <原名>_修正后.docx + 前后对比明细
+    python check.py NC23A005 --fix --overwrite   # 就地覆盖（留 _改前备份）
 """
 import argparse
 import datetime
@@ -66,6 +68,33 @@ def to_markdown(code, path, f, findings):
     return "\n".join(lines)
 
 
+def _fix_detail_md(code, original, fixed, fix_info):
+    """把自动修正的前后对比写成 markdown，附在报告旁方便人工复核。"""
+    d = fix_info or {}
+    diffs = d.get("diffs") or []
+    lines = ["# %s 自动修正前后对比" % code, ""]
+    lines.append("- 原文件（未改动）：`%s`" % original)
+    lines.append("- 修正后另存为：`%s`" % fixed)
+    lines.append("- 自动修正共 **%d** 处：项目编号 %d、单据编号 %d、汇总次数 %d、"
+                 "试验备注 %d、补人员 %d"
+                 % (len(diffs), d.get("pid", 0), d.get("codes", 0),
+                    d.get("summary", 0), d.get("note", 0), d.get("members", 0)))
+    lines.append("")
+    lines.append("> 说明：以上为机器可判定的机械错误，已自动改好；数量、米数、时间先后、"
+                 "证件有效期、照片与签字盖章等仍需人工复核。")
+    lines.append("")
+    if not diffs:
+        lines.append("本次没有可自动修正的问题。")
+        return "\n".join(lines)
+    lines.append("| 类别 | 位置 | 修改前 | 修改后 |")
+    lines.append("|---|---|---|---|")
+    for cat, loc, old, new in diffs:
+        old = (old or "").replace("|", "｜").replace("\n", " ").strip() or "（空）"
+        new = (new or "").replace("|", "｜").replace("\n", " ").strip()
+        lines.append("| %s | %s | %s | %s |" % (cat, loc, old, new))
+    return "\n".join(lines)
+
+
 def to_html(md_text, code):
     import html
     body = []
@@ -90,8 +119,9 @@ def to_html(md_text, code):
 
 
 def run(code, path=None, prefer=0, html_out=False, quiet=False, json_out=None,
-        do_fix=False):
-    """返回 (doc, findings, 报告路径)；出错抛 RuntimeError。"""
+        do_fix=False, overwrite=False):
+    """返回 (doc, findings, 报告路径)；出错抛 RuntimeError。
+    overwrite=True 时自动修正就地覆盖原文件（并留 _改前备份），否则另存 _修正后.docx。"""
     tried = []
     if not path:
         hits, err = find(code)
@@ -116,20 +146,22 @@ def run(code, path=None, prefer=0, html_out=False, quiet=False, json_out=None,
     if not os.path.isfile(path):
         raise RuntimeError("文件打不开：%s" % path)
     fix_info = None
-    if do_fix:                                  # 先把能自动改的改掉，再按改后结果出报告
+    fixed_path = path
+    if do_fix:                                  # 先把能自动改的改掉（另存新文件），再按改后结果出报告
         from checker.fixer import fix_document
         try:
-            fix_info = fix_document(path)
+            fix_info = fix_document(path, save_as=not overwrite)
         except PermissionError:
             raise RuntimeError("文件正被 Word/WPS 或预览占着，关掉后再试：%s" % path)
-    doc = Doc(path)
+        fixed_path = (fix_info or {}).get("saved_as") or path
+    doc = Doc(fixed_path)
     f, findings = check(doc)
     n = summarize(f, findings)
 
     os.makedirs(REPORT_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%m%d-%H%M")
     base = os.path.join(REPORT_DIR, "%s-%s" % (code, stamp))
-    md = to_markdown(code, path, f, findings)
+    md = to_markdown(code, fixed_path, f, findings)
     with io.open(base + ".md", "w", encoding="utf-8") as fh:
         fh.write(md)
     out = base + ".md"
@@ -138,19 +170,31 @@ def run(code, path=None, prefer=0, html_out=False, quiet=False, json_out=None,
             fh.write(to_html(md, code))
         out = base + ".html"
 
+    # 自动修正的「前后对比」明细，随报告一起落盘，命令行用户也可直接查看
+    detail_path = None
+    if fix_info and (fix_info.get("diffs") or fix_info.get("members")):
+        detail_path = base + "_修正明细.md"
+        with io.open(detail_path, "w", encoding="utf-8") as fh:
+            fh.write(_fix_detail_md(code, path, fixed_path, fix_info))
+
     if json_out:
         import json
-        payload = {"ok": True, "code": code, "path": path, "meta": f.meta,
-                   "counts": n, "report": out, "fix": fix_info,
+        payload = {"ok": True, "code": code, "path": fixed_path,
+                   "original_path": path, "meta": f.meta,
+                   "counts": n, "report": out, "fix_detail": detail_path,
+                   "fix": fix_info,
                    "findings": [{"level": x.level, "rule": x.rule, "msg": x.msg} for x in findings]}
         with io.open(json_out, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False, indent=1)
 
     if fix_info and not quiet:
-        print("已自动修正：编号 %d 处、补人员 %d 人（%s）"
-              % (fix_info["codes"], fix_info["members"],
+        print("已自动修正（另存为 %s）：编号 %d 处、补人员 %d 人（%s）"
+              % (fix_info.get("saved_as"), fix_info["codes"], fix_info["members"],
                  "、".join(p[0] for p in fix_info["people"]) or "无"))
-        print("改前备份：%s" % fix_info.get("backup"))
+        if fix_info.get("backup"):
+            print("改前备份：%s" % fix_info["backup"])
+        else:
+            print("原文件未改动：%s" % fix_info.get("original"))
     if not quiet:
         print("文件：%s" % path)
         print("项目：%s" % (f.meta.get("项目名称") or "-"))
@@ -176,11 +220,14 @@ def main():
     ap.add_argument("--html", action="store_true", help="额外输出 html 版报告")
     ap.add_argument("--json", dest="json_out", help="把结果写成 json（界面调用用）")
     ap.add_argument("--fix", dest="do_fix", action="store_true",
-                    help="按规范自动修正（去空格、重排编号、补人员），改前自动备份")
+                    help="按规范自动修正，结果另存为 <原名>_修正后.docx（原文件不动），并输出前后对比")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="配合 --fix 使用：改为就地覆盖原文件（另留 _改前备份）")
     args = ap.parse_args()
     try:
         run(args.code, args.path, args.pick, args.html,
-            quiet=bool(args.json_out), json_out=args.json_out, do_fix=args.do_fix)
+            quiet=bool(args.json_out), json_out=args.json_out, do_fix=args.do_fix,
+            overwrite=args.overwrite)
     except RuntimeError as exc:
         if args.json_out:
             import json
