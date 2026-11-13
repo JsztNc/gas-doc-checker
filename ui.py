@@ -58,7 +58,8 @@ from System.Windows.Forms import (                    # noqa: E402
     FormBorderStyle, FormStartPosition, MessageBox, DialogResult, Panel,
     CharacterCasing, FlatStyle, ColumnHeaderAutoResizeStyle,
     MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle, ComboBox, ComboBoxStyle,
-    DataGridView, DataGridViewSelectionMode)
+    DataGridView, DataGridViewSelectionMode, MouseButtons, ContextMenuStrip,
+    ToolStripMenuItem, Clipboard)
 from System.Drawing import Font, FontStyle, Color, Size, Point   # noqa: E402
 
 FONT = Font("Microsoft YaHei UI", 10)
@@ -184,6 +185,7 @@ class App(object):
         self.list.Columns.Add("级别", 60)
         self.list.Columns.Add("检查项", 180)
         self.list.Columns.Add("问题说明", 700)
+        self.list.MouseUp += self.on_list_menu          # 问题行右键 → 快捷反馈
         f.Controls.Add(self.list)
 
         self.lbl_file = Label()
@@ -357,50 +359,191 @@ class App(object):
                 MessageBox.Show(dlg, "请先写点反馈内容", "意见反馈",
                                 MessageBoxButtons.OK, MessageBoxIcon.Information)
                 return
-            btn_send.Enabled = False
-            btn_send.Text = "提交中…"
+            self._send_feedback(dlg, btn_send, kind, text, contact_text, ctx)
+        btn_send.Click += do_send
 
-            # 结果放在线程间共享的普通容器里，由 UI 线程的 Timer 轮询取回，
-            # 彻底避免「后台线程回调 -> 主窗体 BeginInvoke -> 模态对话框不派发」
-            # 导致的窗口卡死（Windows 标记为「未响应」）。
-            result = {}
+        dlg.ShowDialog(self.form)
 
-            def work():
-                feedback._dbg("thread started")
-                try:
-                    result["ok"], result["msg"] = feedback.submit(
-                        kind, text, contact_text, context=ctx)
-                except Exception as exc:
-                    result["ok"], result["msg"] = False, "提交失败：%s" % exc
-                feedback._dbg("thread done ok=%s" % result.get("ok"))
-            # 关键：必须用 .NET 原生线程（System.Threading.Thread），不能用 Python 的
-            # threading.Thread。从 WinForms 回调里起 threading.Thread 会触发 pythonnet 的
-            # GIL 死锁——主线程卡死（界面「未响应」），新线程也永远拿不到 GIL，work() 根本不执行。
-            # 本项目 main 入口（见文件末尾）同样用 System.Threading.Thread 规避此问题。
-            _th = System.Threading.Thread(System.Threading.ThreadStart(work))
-            _th.IsBackground = True
-            _th.Start()
-            feedback._dbg("thread launched, UI thread returned")
+    # -------------------------------------------------- 反馈提交（公共流程）
+    def _send_feedback(self, dlg, btn_send, kind, text, contact_text, ctx):
+        """后台线程提交反馈 + UI Timer 轮询结果（右上角「反馈」与问题行右键共用）。
 
-            def tick(sender, ev):
-                if not result:                 # 后台还没返回
-                    return
-                timer.Stop()
-                feedback._dbg("tick fired, showing result")
-                if dlg.IsDisposed or not dlg.IsHandleCreated:
-                    return                     # 用户已关掉对话框，不再弹窗
-                btn_send.Enabled = True
-                btn_send.Text = "提交反馈"
-                MessageBox.Show(
-                    dlg, result["msg"], "意见反馈", MessageBoxButtons.OK,
-                    MessageBoxIcon.Information if result["ok"] else MessageBoxIcon.Error)
-                if result["ok"]:
-                    dlg.Close()
+        关键点（V1.3.9 反馈卡死问题的结论，别改回去）：
+        ① 控件值必须在 UI 线程读好、以普通字符串传入后台线程；
+        ② 必须用 .NET 原生线程（System.Threading.Thread），Python 的 threading.Thread
+           会在 WinForms 回调里触发 pythonnet GIL 死锁；
+        ③ 结果由 UI 线程 Timer 轮询取回，不走 BeginInvoke（模态对话框不派发会卡死）。
+        """
+        btn_send.Enabled = False
+        btn_send.Text = "提交中…"
+        result = {}
 
-            timer = System.Windows.Forms.Timer()
-            timer.Interval = 200
-            timer.Tick += tick
-            timer.Start()
+        def work():
+            feedback._dbg("thread started")
+            try:
+                result["ok"], result["msg"] = feedback.submit(
+                    kind, text, contact_text, context=ctx)
+            except Exception as exc:
+                result["ok"], result["msg"] = False, "提交失败：%s" % exc
+            feedback._dbg("thread done ok=%s" % result.get("ok"))
+
+        _th = System.Threading.Thread(System.Threading.ThreadStart(work))
+        _th.IsBackground = True
+        _th.Start()
+        feedback._dbg("thread launched, UI thread returned")
+
+        def tick(sender, ev):
+            if not result:                 # 后台还没返回
+                return
+            timer.Stop()
+            feedback._dbg("tick fired, showing result")
+            if dlg.IsDisposed or not dlg.IsHandleCreated:
+                return                     # 用户已关掉对话框，不再弹窗
+            btn_send.Enabled = True
+            btn_send.Text = "提交反馈"
+            MessageBox.Show(
+                dlg, result["msg"], "意见反馈", MessageBoxButtons.OK,
+                MessageBoxIcon.Information if result["ok"] else MessageBoxIcon.Error)
+            if result["ok"]:
+                dlg.Close()
+
+        timer = System.Windows.Forms.Timer()
+        timer.Interval = 200
+        timer.Tick += tick
+        timer.Start()
+
+    # -------------------------------------------------- 问题行右键快捷反馈
+    def on_list_menu(self, sender, args):
+        """问题列表上右键：弹出菜单，可对这一条问题快捷反馈 / 复制内容。"""
+        if args.Button != MouseButtons.Right:
+            return
+        it = self.list.GetItemAt(args.X, args.Y)
+        if it is None or not self.result:
+            return
+        idx = self.list.Items.IndexOf(it)
+        findings = self.result.get("findings") or []
+        if idx < 0 or idx >= len(findings):
+            return
+        finding = findings[idx]
+        row_text = "%s｜%s｜%s" % (finding.get("level", ""),
+                                   finding.get("rule", ""),
+                                   finding.get("msg", ""))
+
+        menu = ContextMenuStrip()
+        mi_fb = ToolStripMenuItem("反馈这条问题（误判 / 看不懂 / 建议改规则）")
+        mi_fb.Font = FONT
+        mi_fb.Click += lambda s, a: self.row_feedback_dialog(finding, idx)
+        menu.Items.Add(mi_fb)
+        mi_copy = ToolStripMenuItem("复制问题内容")
+        mi_copy.Click += lambda s, a: self.copy_row_text(row_text)
+        menu.Items.Add(mi_copy)
+        menu.Show(self.list, Point(args.X, args.Y))
+
+    def copy_row_text(self, text):
+        """复制一条问题的文字到剪贴板（主线程 STA，可直接调 Clipboard）。"""
+        try:
+            Clipboard.SetText(text)
+            self.say("已复制：%s" % text[:60], BLUE)
+        except Exception:
+            pass
+
+    def row_feedback_dialog(self, finding, row_index):
+        """针对某一条问题的快捷反馈小窗：自动附带该行内容 + 工程编号等基本信息。"""
+        level = (finding or {}).get("level", "")
+        rule = (finding or {}).get("rule", "")
+        msg = (finding or {}).get("msg", "")
+        row_text = "%s｜%s｜%s" % (level, rule, msg)
+
+        dlg = Form()
+        dlg.Text = "反馈这条问题 (v%s)" % updater.local_version()
+        dlg.ClientSize = Size(560, 466)
+        dlg.StartPosition = FormStartPosition.CenterScreen
+        dlg.FormBorderStyle = FormBorderStyle.FixedSingle
+        dlg.MaximizeBox = False
+        dlg.Font = FONT
+
+        lab_q = Label()
+        lab_q.Text = "你反馈的是这条问题："
+        lab_q.Location = Point(20, 14)
+        lab_q.Size = Size(300, 24)
+        dlg.Controls.Add(lab_q)
+
+        quote = TextBox()
+        quote.Multiline = True
+        quote.ReadOnly = True
+        quote.Location = Point(20, 40)
+        quote.Size = Size(520, 64)
+        quote.ScrollBars = ScrollBars.Vertical
+        quote.Font = Font("Microsoft YaHei UI", 9.5)
+        quote.Text = row_text
+        quote.BackColor = Color.FromArgb(245, 246, 248)
+        dlg.Controls.Add(quote)
+
+        lbl1 = Label()
+        lbl1.Text = "反馈类型"
+        lbl1.Location = Point(20, 116)
+        lbl1.Size = Size(80, 24)
+        dlg.Controls.Add(lbl1)
+
+        combo = ComboBox()
+        combo.Location = Point(100, 112)
+        combo.Size = Size(180, 28)
+        combo.DropDownStyle = ComboBoxStyle.DropDownList
+        for item in ("规则误判", "规则有漏", "看不懂这条", "建议改进", "其他"):
+            combo.Items.Add(item)
+        combo.SelectedIndex = 0
+        dlg.Controls.Add(combo)
+
+        lbl2 = Label()
+        lbl2.Text = "简要意见（必填，写给程序员看）"
+        lbl2.Location = Point(20, 148)
+        lbl2.Size = Size(320, 24)
+        dlg.Controls.Add(lbl2)
+
+        body = TextBox()
+        body.Multiline = True
+        body.Location = Point(20, 174)
+        body.Size = Size(520, 150)
+        body.ScrollBars = ScrollBars.Vertical
+        body.Font = Font("Microsoft YaHei UI", 10)
+        dlg.Controls.Add(body)
+
+        lbl3 = Label()
+        lbl3.Text = "联系方式（选填，方便回复你）"
+        lbl3.Location = Point(20, 330)
+        lbl3.Size = Size(300, 24)
+        dlg.Controls.Add(lbl3)
+
+        contact = TextBox()
+        contact.Location = Point(20, 354)
+        contact.Size = Size(520, 28)
+        dlg.Controls.Add(contact)
+
+        tip = Label()
+        tip.Text = "提交自动附带：工程编号、这条问题的内容、版本号；匿名，无需登录。"
+        tip.ForeColor = Color.Gray
+        tip.Location = Point(20, 386)
+        tip.Size = Size(520, 22)
+        dlg.Controls.Add(tip)
+
+        btn_send = mk_button("提交反馈", 20, 414, 110, 34, BLUE)
+        dlg.Controls.Add(btn_send)
+        btn_cancel = mk_button("取消", 142, btn_send.Location.Y, 80, 34, None, bold=False)
+        dlg.Controls.Add(btn_cancel)
+        btn_cancel.Click += lambda s, a: dlg.Close()
+
+        def do_send(s, a):
+            kind = str(combo.Text or "其他")
+            text = body.Text or ""
+            contact_text = contact.Text or ""
+            if not text.strip():
+                MessageBox.Show(dlg, "请先写一句意见（哪里不对 / 想怎么改）", "反馈这条问题",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information)
+                return
+            ctx = dict(self.context)
+            ctx["action"] = "右键反馈问题行"
+            ctx["detail"] = "第 %d 行（%s）：%s" % (row_index + 1, kind, row_text)
+            self._send_feedback(dlg, btn_send, kind, text, contact_text, ctx)
         btn_send.Click += do_send
 
         dlg.ShowDialog(self.form)
@@ -617,9 +760,9 @@ class App(object):
             row.ForeColor = LEVEL_COLOR.get(lv, Color.Black)
         self.list.EndUpdate()
         if err:
-            self.say("错误 %d 条，警告 %d 条 —— 先改错误项" % (err, warn), LEVEL_COLOR["错误"])
+            self.say("错误 %d 条，警告 %d 条 —— 先改错误项；在问题行上右键可反馈" % (err, warn), LEVEL_COLOR["错误"])
         elif warn:
-            self.say("没有错误，警告 %d 条" % warn, LEVEL_COLOR["警告"])
+            self.say("没有错误，警告 %d 条；在问题行上右键可反馈" % warn, LEVEL_COLOR["警告"])
         else:
             self.say("没发现明显问题（提示 %d 条）" % info, Color.FromArgb(23, 161, 90))
         self.list.Columns[2].Width = 700
