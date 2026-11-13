@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
-"""检查更新模块 —— 单文件版：从 GitHub Releases 下载最新 exe 并替换自己。
+"""检查更新模块 —— V1.4.2 起为多文件增量更新。
 
 设计要点：
-1. 只用标准库（urllib / json），不额外装依赖，打包后也能跑。
-2. 程序是 PyInstaller --onefile 打出的单个 exe，运行时解压到临时目录；
-   version.txt、使用说明.txt、bin/es.exe 都作为资源打在 exe 内部。
-3. Release 只上传一个 .exe 资产（如 gas-doc-checker-v1.1.0-win64.exe）。
-   检查更新时下载这个 exe，校验是有效 PE 文件后，用系统临时目录的 bat
-   等主程序退出 → 用新 exe 覆盖旧 exe → 重新打开。
-4. 只替换 exe 自己；检查报告、_tmp、用户放在目录里的东西一律不动。
+1. 只用标准库（urllib / json / zipfile / hashlib），打包后也能跑。
+2. 程序是多文件版（onedir）：exe + _internal + checker/（审核规则外挂）等，
+   整个目录打成 zip 发布到 GitHub Release。
+3. 更新流程 = 下载 zip → 解压 → 逐文件与本地比对 md5 → 只覆盖有变动的文件：
+   - 未被占用的文件（checker/*.py、使用说明等）当场替换，改前备份到
+     `_改前备份/更新-<版本>/`；
+   - 被占用的文件（exe 自身、_internal 里的 dll）记入待补拷清单，由替换脚本
+     在主程序退出后补拷，然后重新打开程序。
+4. 兼容旧版：老版本（v1.4.1 及之前）是 onefile 单 exe，其更新器只认 .exe 资产；
+   因此 Release 同时附一个过渡用单文件 exe，老用户自更新拿到它后，即具备
+   增量更新能力，之后每次只换有变动的文件。
 
-发版：tag 用 v1.1.0，把编好的 exe 作为 Release 资产上传即可。
-老版本 v1.0.x 是 zip 整包结构，本模块也兼容读取 zip（见 _asset_from_release）。
+发版：tag 用 v1.4.2，上传两个资产：
+    gas-doc-checker-v1.4.2.zip   多文件整包（新格式，增量更新的数据源）
+    gas-doc-checker-v1.4.2.exe   过渡用单文件版（checker 编译在内）
 """
+import hashlib
 import json
 import os
 import re
@@ -40,8 +46,8 @@ def base_dir():
 
 
 def _resource_path(name):
-    """优先用打包资源目录（onefile 解压出的 _MEIPASS，反映 exe 内嵌真实版本），
-    再回退到 exe 同级目录。这样版本号不会被源码目录里那份 version.txt 掩盖。"""
+    """优先用打包资源目录（onefile 解压出的 _MEIPASS / onedir 的 _internal，
+    反映程序内嵌真实版本），再回退到 exe 同级目录。"""
     for d in (getattr(sys, "_MEIPASS", None), BASE):
         if not d:
             continue
@@ -60,7 +66,7 @@ def local_version():
 
 
 def help_text():
-    """返回内嵌的使用说明全文（供界面「使用说明」窗口显示）。"""
+    """返回使用说明全文（供界面「使用说明」窗口显示）。"""
     try:
         with open(_resource_path(HELP_FILE), "r", encoding="utf-8") as fh:
             return fh.read()
@@ -83,12 +89,13 @@ def compare_version(a, b):
 
 
 def _asset_from_release(data):
-    """从 release 数据里挑可更新的资产：优先 .exe，退回 .zip（兼容旧版）。"""
+    """从 release 数据里挑可更新的资产：V1.4.2 起优先 zip（多文件增量包），
+    没有再退回 exe（过渡单文件 / 更老的发版）。"""
     assets = data.get("assets") or []
-    for name, url in _iter_assets(assets, ".exe"):
-        return name, url, "exe"
     for name, url in _iter_assets(assets, ".zip"):
         return name, url, "zip"
+    for name, url in _iter_assets(assets, ".exe"):
+        return name, url, "exe"
     return "", "", ""
 
 
@@ -169,82 +176,167 @@ def download_release(url, on_progress=None, timeout=300):
     return dst
 
 
-def _find_exe_in_zip(zip_path, stage):
-    """兼容旧版 zip 整包：解压并找出里面的 exe（或 ui.py+check.py）。"""
+# ---------------------------------------------------------------- 增量更新
+def _md5(path, chunk=1 << 20):
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for b in iter(lambda: fh.read(chunk), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _extract_zip(zip_path, stage):
+    """解压 zip 到 stage，返回内容根目录（兼容 zip 里带一层同名目录）。"""
+    if os.path.isdir(stage):
+        shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
-        names = zf.namelist()
-        firsts = set(n.replace("\\", "/").lstrip("/").split("/")[0] for n in names if n)
+        names = [n.replace("\\", "/").lstrip("/") for n in zf.namelist() if n]
+        firsts = set(n.split("/")[0] for n in names)
         root = ""
-        if len(firsts) == 1:
-            only = next(iter(firsts))
-            if all(n.replace("\\", "/").lstrip("/").split("/")[0] == only for n in names):
-                root = only if any("/" in n for n in names if n) else ""
+        if len(firsts) == 1 and any("/" in n for n in names):
+            root = next(iter(firsts))
         zf.extractall(stage)
-    src = os.path.join(stage, root) if root else stage
-    exe = os.path.join(src, EXE_NAME)
-    if os.path.isfile(exe):
-        return exe
-    return None
+    return os.path.join(stage, root) if root else stage
 
 
-def prepare_update(asset_path, tag):
-    """校验下载的文件，生成替换脚本，返回 (bat路径, 说明字符串)。
+def _changed_files(src):
+    """src 里每个文件与 BASE 同路径比对，返回有变动（或本地没有）的相对路径列表。"""
+    out = []
+    for root, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in ("_tmp", "检查报告", "_改前备份")]
+        for name in files:
+            sp = os.path.join(root, name)
+            rel = os.path.relpath(sp, src)
+            tp = os.path.join(BASE, rel)
+            try:
+                if os.path.isfile(tp) and _md5(sp) == _md5(tp):
+                    continue
+            except Exception:
+                pass
+            out.append(rel)
+    return out
 
-    单文件版只做一件事：用新 exe 覆盖旧 exe。
-    兼容旧 zip：从 zip 里取出 exe 再替换。
-    """
-    if asset_path.lower().endswith(".zip"):
-        work = os.path.join(BASE, "_tmp", "update")
-        stage = os.path.join(work, "new")
-        if os.path.isdir(stage):
-            shutil.rmtree(stage, ignore_errors=True)
-        os.makedirs(stage, exist_ok=True)
-        new_exe = _find_exe_in_zip(asset_path, stage)
-        if not new_exe:
-            raise RuntimeError("这个 zip 里没有 %s，已取消更新" % EXE_NAME)
-    else:
-        new_exe = asset_path
-        with open(new_exe, "rb") as fh:
-            if fh.read(2) != b"MZ":
-                raise RuntimeError("下载的文件不是有效的 exe，已取消更新")
 
-    target = os.path.join(BASE, EXE_NAME) if getattr(sys, "frozen", False) else sys.executable
-    if not os.path.isfile(target):
-        raise RuntimeError("找不到当前程序 %s，已取消更新" % target)
+def _backup(rel, tag):
+    """把要被覆盖的现有文件备份到 _改前备份/更新-<tag>/<rel>。"""
+    tp = os.path.join(BASE, rel)
+    if not os.path.isfile(tp):
+        return
+    bdir = os.path.join(BASE, "_改前备份", "更新-" + tag)
+    dst = os.path.join(bdir, rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if not os.path.exists(dst):
+        shutil.copy2(tp, dst)
 
-    pid = os.getpid()
-    # bat 放到系统临时目录，避免被更新流程影响
+
+def _apply_now(src, changed, tag):
+    """当场复制未锁定的变动文件，返回 (已拷, 待补拷) 两个相对路径列表。"""
+    copied, deferred = [], []
+    for rel in changed:
+        sp = os.path.join(src, rel)
+        tp = os.path.join(BASE, rel)
+        if os.path.isfile(tp):
+            _backup(rel, tag)
+        try:
+            os.makedirs(os.path.dirname(tp), exist_ok=True)
+            shutil.copy2(sp, tp)
+            copied.append(rel)
+        except PermissionError:
+            deferred.append(rel)
+        except OSError:
+            deferred.append(rel)
+    return copied, deferred
+
+
+def _write_pending_bat(deferred, src, tag, pid):
+    """生成替换脚本：等主程序退出 → 按清单补拷被锁定的文件 → 重启程序。"""
     fd, bat = tempfile.mkstemp(prefix="gasdoc_update_", suffix=".bat")
     os.close(fd)
+    lst = os.path.join(BASE, "_tmp", "update", "pending_files.txt")
+    os.makedirs(os.path.dirname(lst), exist_ok=True)
+    with open(lst, "w", encoding="gbk", errors="replace") as fh:
+        for rel in deferred:
+            fh.write("%s\t%s\r\n" % (os.path.join(src, rel),
+                                     os.path.join(BASE, rel)))
     q = lambda s: '"%s"' % s.replace('"', '""')
     lines = [
         "@echo off",
-        "chcp 65001 >nul",
+        "chcp 936 >nul",
         "title 正在更新程序…",
-        "echo 正在更新线上资料检查工具，请勿关闭此窗口。",
+        "echo 正在更新线上资料检查工具（仅替换有变动的文件），请勿关闭此窗口。",
         ":wait",
         'tasklist /FI "PID eq %d" 2>NUL | findstr /I /C:"%d" >NUL' % (pid, pid),
         "if not errorlevel 1 (ping -n 2 127.0.0.1 >NUL & goto wait)",
         "ping -n 2 127.0.0.1 >NUL",
         "set RETRY=0",
         ":copy",
-        'copy /Y /B %s %s >NUL' % (q(new_exe), q(target)),
+        'for /f "usebackq tokens=1,2 delims=	" %%A in (%s) do (' % q(lst),
+        '  if not exist "%%~dpB" mkdir "%%~dpB"',
+        '  copy /Y /B "%%A" "%%B" >NUL',
+        ")",
+        'copy /Y /B %s %s >NUL' % (q(os.path.join(src, EXE_NAME)),
+                                   q(os.path.join(BASE, EXE_NAME))),
         "if not errorlevel 1 goto copied",
         "set /a RETRY+=1",
         "if %RETRY% lss 15 (ping -n 1 127.0.0.1 >NUL & goto copy)",
         "goto fail",
         ":copied",
-        'start "" %s' % q(target),
+        'start "" %s' % q(os.path.join(BASE, EXE_NAME)),
+        'rd /s /q %s >NUL 2>&1' % q(src),
         "echo 更新完成，窗口将在几秒后关闭。",
         "ping -n 4 127.0.0.1 >NUL",
         'del /F /Q "%~f0" >NUL 2>&1',
         "goto :eof",
         ":fail",
-        "echo 替换失败：旧程序可能被占用，请手动把新 exe 拷到程序目录。",
+        "echo 替换失败：部分文件仍被占用，请稍后重试更新或手动覆盖。",
         "pause",
     ]
-    with open(bat, "w", encoding="utf-8") as fh:
+    with open(bat, "w", encoding="gbk", errors="replace") as fh:
         fh.write("\r\n".join(lines) + "\r\n")
+    return bat
+
+
+def prepare_update(asset_path, tag):
+    """校验下载的更新包，执行增量替换，返回 (bat路径, 说明字符串)。
+
+    zip（V1.4.2 起的标准形态）：解压后逐文件比对，只覆盖有变动的文件；
+      未锁定的当场替换（先备份），被锁定的（exe、加载中的 dll）写进
+      待补拷清单，由替换脚本在程序退出后补拷并重启程序。
+    exe（过渡单文件版自更新）：与旧版行为一致，只替换 exe 自己。
+    """
+    work = os.path.join(BASE, "_tmp", "update")
+    if asset_path.lower().endswith(".zip"):
+        src = _extract_zip(asset_path, os.path.join(work, "new"))
+        if not os.path.isfile(os.path.join(src, EXE_NAME)):
+            raise RuntimeError("这个 zip 里没有 %s，已取消更新" % EXE_NAME)
+        changed = _changed_files(src)
+        if not changed:
+            raise RuntimeError("与当前版本内容一致，没有需要更新的文件")
+        copied, deferred = _apply_now(src, changed, tag)
+        bat = _write_pending_bat(deferred, src, tag, os.getpid())
+        msg = ("已下载 v%s：共 %d 个文件有变动，其中 %d 个已当场替换%s"
+               % (tag, len(changed), len(copied),
+                  "，%d 个（程序本体等）将在退出后替换" % len(deferred) if deferred else ""))
+        return bat, msg
+
+    # ---- 兼容：exe 资产（过渡单文件版 / 旧版） ----
+    new_exe = asset_path
+    with open(new_exe, "rb") as fh:
+        if fh.read(2) != b"MZ":
+            raise RuntimeError("下载的文件不是有效的 exe，已取消更新")
+    work2 = os.path.join(BASE, "_tmp", "update")
+    os.makedirs(work2, exist_ok=True)
+    src = os.path.join(work2, "exe_stage")
+    if os.path.isdir(src):
+        shutil.rmtree(src, ignore_errors=True)
+    os.makedirs(src, exist_ok=True)
+    staged_exe = os.path.join(src, EXE_NAME)
+    shutil.copy2(new_exe, staged_exe)
+    target = os.path.join(BASE, EXE_NAME)
+    if os.path.isfile(target):
+        _backup(EXE_NAME, tag)
+    bat = _write_pending_bat([EXE_NAME], src, tag, os.getpid())
     return bat, "已下载 v%s，程序即将关闭并完成替换" % tag
 
 
