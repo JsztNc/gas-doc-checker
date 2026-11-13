@@ -57,7 +57,8 @@ from System.Windows.Forms import (                    # noqa: E402
     Form, Button, TextBox, Label, ListView, ColumnHeader, View, Application,
     FormBorderStyle, FormStartPosition, MessageBox, DialogResult, Panel,
     CharacterCasing, FlatStyle, ColumnHeaderAutoResizeStyle,
-    MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle, ComboBox, ComboBoxStyle)
+    MessageBoxButtons, MessageBoxIcon, ScrollBars, DockStyle, ComboBox, ComboBoxStyle,
+    DataGridView, DataGridViewSelectionMode)
 from System.Drawing import Font, FontStyle, Color, Size, Point   # noqa: E402
 
 FONT = Font("Microsoft YaHei UI", 10)
@@ -499,17 +500,21 @@ class App(object):
         if self.proc is not None and self.proc.poll() is None:
             self.say("上一次还在跑，稍等…", LEVEL_COLOR["警告"])
             return
-        path = (self.result or {}).get("path")
+        # 再次修正时始终基于「原文件」，避免生成 xxx_修正后_修正后.docx
+        path = ((self.result or {}).get("original_path")
+                or (self.result or {}).get("path"))
         code = (self.txt.Text or "").strip().upper()
         if not path and not code:
             MessageBox.Show(self.form, "先输入工程编号并检查一次，再点自动修正", "自动修正")
             return
-        ask = ("将按规范自动修正这份资料（原文件先备份到同目录「_改前备份」）：\n\n"
+        ask = ("将按规范自动修正这份资料：\n\n"
                "· 单据编号：去掉空格、按工序重排流水、消除重复\n"
                "· 项目编号：整套统一为同一个编号\n"
                "· 工序质量汇总表：检查次数按实际单据张数回写\n"
                "· 试验记录：备注栏补「发泡剂检漏」标准句\n"
                "· 项目人员信息表：把特种工名单补齐\n\n"
+               "修正结果会【另存】为 <原名>_修正后.docx，原文件保持不动；\n"
+               "改完弹出「修改前 → 修改后」逐条对比，并自动重新检查另存的文件。\n\n"
                "注：只改格式 / 编号 / 次数 / 统一文本这类机械错误；时间先后、米数取舍、"
                "缺哪张单、照片与签字盖章等需判断的，仍要人工。要开始吗？")
         if MessageBox.Show(self.form, ask, "自动修正",
@@ -621,24 +626,94 @@ class App(object):
         if getattr(self, "fixing", False) and data.get("fix"):
             fx = data["fix"]
             self.fixing = False
-            who = "、".join(x[0] for x in fx.get("people") or []) or "无"
-            parts = []
-            if fx.get("codes"):
-                parts.append("· 单据编号 %d 处（去空格、重排流水、消除重复）" % fx["codes"])
-            if fx.get("pid"):
-                parts.append("· 统一项目编号 %d 处" % fx["pid"])
-            if fx.get("summary"):
-                parts.append("· 修正汇总表检查次数 %d 处" % fx["summary"])
-            if fx.get("note"):
-                parts.append("· 补全发泡剂检漏备注 %d 张" % fx["note"])
-            if fx.get("members"):
-                parts.append("· 补充人员 %d 人（%s）" % (fx["members"], who))
-            if not parts:
-                parts.append("· 没有可自动修正的问题")
-            MessageBox.Show(self.form,
-                            "已自动修正：\n\n" + "\n".join(parts)
-                            + "\n\n改前备份：%s" % (fx.get("backup") or "-"),
-                            "自动修正完成", MessageBoxButtons.OK, MessageBoxIcon.Information)
+            saved = fx.get("saved_as") or "-"
+            self.lbl_file.Text = "已另存（原文件未改动）：" + (data.get("path") or "")
+            if not (fx.get("diffs") or fx.get("members")):
+                MessageBox.Show(self.form,
+                                "没有可自动修正的问题。\n\n"
+                                "结果仍另存为：%s\n原文件未改动：%s"
+                                % (saved, fx.get("original") or "-"),
+                                "自动修正完成", MessageBoxButtons.OK,
+                                MessageBoxIcon.Information)
+            else:
+                self.show_fix_diff(fx, data.get("fix_detail"))
+
+    def show_fix_diff(self, fx, detail_path=None):
+        """自动修正后：逐条展示「修改前 → 修改后」对比，并给出另存 / 明细入口。"""
+        diffs = fx.get("diffs") or []
+        original = fx.get("original") or "-"
+        saved = fx.get("saved_as") or "-"
+
+        dlg = Form()
+        dlg.Text = "自动修正 · 修改前后对比"
+        dlg.Font = FONT
+        dlg.Size = Size(1030, 650)
+        dlg.StartPosition = FormStartPosition.CenterParent
+        dlg.MinimizeBox = False
+        dlg.MaximizeBox = False
+
+        def add_label(text, y, color, bold=False):
+            lab = Label()
+            lab.Text = text
+            lab.Location = Point(16, y)
+            lab.Size = Size(982, 22)
+            lab.AutoSize = False
+            lab.AutoEllipsis = True
+            lab.Font = FONT_B if bold else FONT
+            lab.ForeColor = color
+            dlg.Controls.Add(lab)
+
+        add_label("原文件（未改动）：" + original, 14, LEVEL_COLOR["提示"])
+        add_label("已另存为：" + saved, 40, Color.FromArgb(23, 161, 90), bold=True)
+
+        parts = []
+        for key, name in (("codes", "单据编号"), ("pid", "项目编号"),
+                          ("summary", "汇总次数"), ("note", "试验备注"),
+                          ("members", "补人员")):
+            if fx.get(key):
+                parts.append("%s %d 处" % (name, fx[key]))
+        add_label("共修正 %d 处：%s　（主窗口里是另存文件的复检结果）"
+                  % (len(diffs), "、".join(parts) or "无"), 68, Color.Black)
+
+        grid = DataGridView()
+        grid.Location = Point(16, 98)
+        grid.Size = Size(982, 448)
+        grid.ReadOnly = True
+        grid.AllowUserToAddRows = False
+        grid.AllowUserToDeleteRows = False
+        grid.AllowUserToResizeRows = False
+        grid.RowHeadersVisible = False
+        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        grid.BackgroundColor = Color.White
+        for cname, header, width in (("cat", "类别", 100), ("loc", "位置", 300),
+                                     ("old", "修改前", 285), ("new", "修改后", 285)):
+            grid.Columns.Add(cname, header)
+            grid.Columns[grid.Columns.Count - 1].Width = width
+        grid.Columns[2].DefaultCellStyle.ForeColor = Color.FromArgb(190, 60, 60)
+        grid.Columns[3].DefaultCellStyle.ForeColor = Color.FromArgb(23, 130, 70)
+        for d in diffs:
+            i = grid.Rows.Add()
+            row = grid.Rows[i]
+            row.Cells[0].Value = d[0]
+            row.Cells[1].Value = d[1]
+            row.Cells[2].Value = d[2] if d[2] else "（空）"
+            row.Cells[3].Value = d[3]
+        dlg.Controls.Add(grid)
+
+        by = 558
+        b_open = mk_button("打开修正后文件", 16, by, 150, 32,
+                           Color.FromArgb(23, 119, 255))
+        b_open.Click += lambda s, a: open_path(saved)
+        dlg.Controls.Add(b_open)
+        b_detail = mk_button("打开对比明细", 176, by, 130, 32)
+        b_detail.Enabled = bool(detail_path and os.path.isfile(detail_path))
+        b_detail.Click += lambda s, a: open_path(detail_path)
+        dlg.Controls.Add(b_detail)
+        b_close = mk_button("关闭", 878, by, 120, 32)
+        b_close.Click += lambda s, a: dlg.Close()
+        dlg.Controls.Add(b_close)
+
+        dlg.ShowDialog(self.form)
 
 
 def main():
