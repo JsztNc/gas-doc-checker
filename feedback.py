@@ -33,6 +33,47 @@ API_ISSUES = "https://api.github.com/repos/%s/issues" % GITHUB_REPO
 ISSUES_PAGE = "https://github.com/%s/issues?q=label%%3Auser-feedback" % GITHUB_REPO
 
 # ------------------------------------------------------------------
+# V1.3.9 新增：信息平台镜像通道（独立于上面的 GitHub Issues 原通道）。
+# 用户点一次「提交反馈」，原通道照常走；同时把同一条反馈上报到信息平台，
+# 管理端（信息平台 exe / 网页后台）的「消息反馈」页签即可看到。
+# 镜像通道不需要任何凭证（sharecode 随 URL），失败只记 debug 日志，
+# 绝不影响原通道的返回结果与提示文案。
+PLATFORM_URL = "https://info-platform.app.workbuddy.host"
+PLATFORM_SHARECODE = "KC4MIHDOVT"
+PLATFORM_APP = "线上资料检查"
+
+
+def _platform_post(kind, content, contact="", context=None):
+    """把同一条反馈上报到信息平台。返回 (ok, msg)。"""
+    ctx = context or {}
+    lines = ["【%s】%s" % (kind or "其他", content)]
+    if (contact or "").strip():
+        lines.append("联系方式：%s" % contact.strip())
+    lines.append("工程编号：%s" % (ctx.get("code") or "（未输入）"))
+    if ctx.get("action"):
+        lines.append("当前操作：%s" % ctx["action"])
+    if ctx.get("detail"):
+        lines.append("操作细节：%s" % ctx["detail"])
+    if ctx.get("time"):
+        lines.append("操作时间：%s" % ctx["time"])
+    lines.append("版本：v%s" % version())
+    payload = {
+        "app": PLATFORM_APP,
+        "user": (contact or "").strip() or "匿名",
+        "content": "\n".join(lines),
+    }
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        "%s/api/feedback?sharecode=%s" % (PLATFORM_URL, PLATFORM_SHARECODE),
+        data=data, method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8",
+                 "User-Agent": "gas-doc-checker-platform/%s" % version()})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        r = json.loads(resp.read().decode("utf-8", "replace"))
+    return bool(r.get("ok")), r.get("msg") or ""
+# ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
 # 最小权限 token（fine-grained PAT：仅 gas-doc-checker 仓库，Issues: write）
 # 明文凭证绝不能写进源码/仓库（GitHub secret scanning 会拦截推送）。
 # 改为从同目录的 feedback_token.txt 读取；该文件已 gitignore，打包时作为
@@ -97,6 +138,13 @@ def submit(kind, content, contact="", context=None):
         return False, "反馈内容不能为空"
     _dbg("submit called: kind=%s len=%d" % (kind, len(content)))
     t0 = time.time()
+
+    # V1.3.9 镜像通道：同步上报信息平台（超时 8 秒封顶），成败都不影响后续原通道
+    try:
+        _platform_post(kind, content, contact, context)
+        _dbg("platform mirror: ok elapsed=%.2fs" % (time.time() - t0))
+    except Exception as exc:
+        _dbg("platform mirror failed: %s" % exc)
 
     title = "%s %s - %s" % (
         TITLE_PREFIX,

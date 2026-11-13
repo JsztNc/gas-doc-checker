@@ -12,3 +12,7 @@ _tmp/
 
 # 反馈提交凭证（绝不能入库）
 feedback_token.txt
+
+# V1.3.9 打包产物
+dist_v139/
+build_v139/
