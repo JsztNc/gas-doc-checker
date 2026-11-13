@@ -590,35 +590,52 @@ class App(object):
         notes = (info.get("notes") or "").strip()
         if len(notes) > 480:
             notes = notes[:480] + " …"
-        msg = "发现新版本 v%s（当前 v%s，发布于 %s）\n\n" % (
-            info["latest"], info["local"], info.get("published_at") or "-")
+        lan = info.get("channel") == "lan"
+        msg = "发现新版本 v%s（当前 v%s，来源：%s%s）\n\n" % (
+            info["latest"], info["local"],
+            "局域网" if lan else "GitHub",
+            "" if lan else ("，发布于 %s" % (info.get("published_at") or "-")))
         if notes:
             msg += "更新说明：\n%s\n\n" % notes
-        if info.get("asset_url"):
-            msg += "是否现在下载并自动更新？\n（程序会关闭几秒，然后重新打开；检查报告不会动）"
+        if lan:
+            msg += ("是否现在从局域网更新？\n"
+                    "（只拷有变动的文件，程序会关闭几秒后自动重开；检查报告不会动）")
+        elif info.get("asset_url"):
+            msg += ("是否现在下载并自动更新？\n"
+                    "（程序会关闭几秒，然后重新打开；检查报告不会动）")
         else:
             msg += "这个版本没有提供 zip 整包，只能去 releases 页面手动下载。"
         if MessageBox.Show(self.form, msg, "发现新版本",
                            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes:
             return
-        if info.get("asset_url"):
+        if lan or info.get("asset_url"):
             self._download_and_apply(info)
         else:
             updater.open_releases()
 
     def _download_and_apply(self, info):
+        lan = info.get("channel") == "lan"
         self.updating = True
         self.btn_update.Enabled = False
-        self.say("正在下载 v%s…" % info["latest"], BLUE)
+        self.say("正在从局域网复制 v%s…" % info["latest"] if lan
+                 else "正在下载 v%s…" % info["latest"], BLUE)
 
         def progress(done, total):
-            txt = ("%d%%" % (done * 100 // total)) if total else ("%d KB" % (done // 1024))
-            self._ui(lambda: self.say("正在下载 v%s… %s" % (info["latest"], txt), BLUE))
+            if lan:
+                line = "正在从局域网复制 v%s… %d/%d 个文件" % (info["latest"], done, total)
+            else:
+                txt = ("%d%%" % (done * 100 // total)) if total else ("%d KB" % (done // 1024))
+                line = "正在下载 v%s… %s" % (info["latest"], txt)
+            # 进度回调来自后台线程，必须 marshal 回 UI 线程再碰控件
+            self._ui(lambda: self.say(line, BLUE))
 
         def work():
             try:
-                path = updater.download_release(info["asset_url"], on_progress=progress)
-                bat, tip = updater.prepare_update(path, info["latest"])
+                if lan:
+                    bat, tip = updater.prepare_lan_update(info["latest"], on_progress=progress)
+                else:
+                    path = updater.download_release(info["asset_url"], on_progress=progress)
+                    bat, tip = updater.prepare_update(path, info["latest"])
                 updater.start_update(bat)
                 self._ui(lambda: self.say(tip, Color.FromArgb(23, 161, 90)))
                 self._ui(lambda: Application.Exit())

@@ -12,8 +12,10 @@ Windows 10/11 64 位免安装，**单文件** `线上资料检查.exe`，双击�
 - 结果按 错误 / 警告 / 提示 三级着色
 - 底部按钮：打开文档、自动修正、打开报告、报告文件夹
 - 右上角「使用说明」：弹出可滚动窗口显示完整说明
-- 右上角「检查更新」：连 GitHub Releases 检查新版本，有新版则一键下载新 exe、自动替换并重启
+- 右上角「检查更新」：**先查局域网共享目录**（`\\Jsztnas\团队文件\内部应用\线上资料修改程序`），
+  有新版直接从内网增量拷贝；连不上共享再回退 GitHub Releases。替换后自动重启
 - 右上角「反馈」：弹出窗口填写意见（类型/内容/选填联系方式），一键匿名提交到 GitHub Issues，无需登录账号
+- 检查结果出来后在**任意问题行上点右键**：可就这一条快捷反馈（自动附带工程编号与该行原文）或复制内容
 
 详细用法见 [使用说明.txt](使用说明.txt)（界面「使用说明」按钮里也是这份内容）。
 
@@ -31,7 +33,7 @@ exe 旁边会自动生成 `检查报告/`（历次报告）和 `_tmp/`（临时�
 | --- | --- |
 | `ui.py` | WinForms 窗口界面（含使用说明、检查更新按钮） |
 | `check.py` | 检查主程序，命令行入口 |
-| `updater.py` | 自动更新：GitHub API 查版本 → 下载新 exe → 生成替换脚本 → 重启 |
+| `updater.py` | 自动更新：局域网共享优先（逐文件 md5 增量）→ 回退 GitHub；生成替换脚本 → 重启 |
 | `version.txt` | 当前版本号，发新版时改这里 |
 | `checker/` | 解析与规则（docx_reader / rules / finder / fixer） |
 | `bin/es.exe` | Everything 命令行搜索工具（打包时内嵌） |
@@ -76,15 +78,32 @@ Windows 会给从网盘或邮件下载的文件打上"来自网络"标记（Zone
 
 ## 发布新版本
 
-1. 修改 `version.txt` 的版本号，例如 `1.3.7`
-2. 用 PyInstaller **onefile** 模式重新打包（需把 `bin/es.exe`、`version.txt`、
-   `使用说明.txt` 作为 `--add-data` 打进去），得到单个 `线上资料检查.exe`
-3. 在 GitHub 上建 Release，tag 填 `v1.3.7`，**把这个 exe 作为唯一附件上传**
-   （文件名 `gas-doc-checker-v1.3.7.exe`，更新器按 `.exe` 资产自动识别，不卡文件名）
-4. 客户端点「检查更新」即可自动下载新 exe 并替换自己
+程序是**多文件版**（onedir）：`线上资料检查.exe` + `_internal/` + `checker/`（审核规则，可改）+ `bin/` + 几个 bat。
 
-自动更新**只替换 exe 自己**；`检查报告/` 和用户放在目录里的其他文件一律不动。
-为兼容 v1.0.x 老用户，Release 可同时附一份旧结构的 zip 整包（老版更新逻辑找 zip）。
+1. 改 `version.txt` 的版本号，例如 `1.4.5`
+2. 打包：`python -m PyInstaller --noconfirm --distpath dist_v145 --workpath build_v145 线上资料检查.spec`
+3. 组装发布目录：把 `dist_v145/线上资料检查/` 拷成 `dist_v145/stage/`，再补 `checker/`（删 `__pycache__`）、
+   `bin/`、4 个 bat、规范 md；压成 `gas-doc-checker-v1.4.5.zip`（顶层目录名 `线上资料检查`）
+4. 单文件过渡版（给 v1.4.1 及更早的老用户）：`ONEFILE=1 UPX_DIR=<不存在路径> python -m PyInstaller --noconfirm ...`
+   → 改名为 `gas-doc-checker-v1.4.5.exe`（注意：`--noupx` 不能和 .spec 同用）
+5. 发 GitHub Release `v1.4.5`，上传 zip + exe 两个资产
+6. **同步局域网**（推荐，客户端优先走这条路）：
+   `robocopy dist_v145\stage "\\Jsztnas\团队文件\内部应用\线上资料修改程序" /E`
+   再把该目录的 `version.txt` 改成 `1.4.5`（**无 BOM**），可选放一份 `更新说明.txt`
+
+## 自动更新原理（V1.4.4 起双通道，局域网优先）
+
+`updater.py` 只用 Python 标准库：
+
+1. **局域网**：读 `\\Jsztnas\团队文件\内部应用\线上资料修改程序\version.txt`，
+   与内嵌版本号比较；有新版本就逐文件比 md5，只把变动的文件拷到本地暂存，
+   再走统一的备份 + 替换 + 退出后补拷流程。共享目录不可用或没有版本标记 → 自动回退第 2 步。
+2. **GitHub**：`GET /repos/JsztNc/gas-doc-checker/releases/latest`，比较 `tag_name`；
+   有新版则下载 zip（老版本兼容 exe 资产）到 `_tmp/update/`，解压后逐文件比较 md5
+3. 只覆盖有变动的文件：未锁定的当场替换并备份到 `_改前备份\更新-<版本>\`；
+   被锁定的（exe、加载中的 dll）写进 `pending_files.txt`，由临时目录里的 bat
+   等主程序退出后补拷并重启
+4. 检查报告、`_tmp/`、用户自己放的文件一律不动
 
 ## 用户反馈
 

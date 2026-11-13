@@ -40,6 +40,21 @@ RELEASES_PAGE = "https://github.com/%s/releases" % GITHUB_REPO
 EXE_NAME = "线上资料检查.exe"
 HELP_FILE = "使用说明.txt"
 
+# ---------------------------------------------------------------- 局域网通道
+# V1.4.4 起：内网共享目录优先于 GitHub。该目录放的是一份完整的程序目录
+# （线上资料检查.exe + _internal + checker + bin + bat ...），外加一个
+# 顶层的 version.txt 作为版本号标记。更新时逐文件比 md5，只拷有变动的文件，
+# 与 zip 通道完全同一套替换/备份/补拷逻辑。
+# 好处：不依赖外网、不受 GitHub 限速影响；访问失败自动回退 GitHub。
+LAN_ROOT = r"\\Jsztnas\团队文件\内部应用\线上资料修改程序"
+LAN_VERSION_FILE = "version.txt"
+# 发布方生成的文件清单（相对路径 → 大小/md5）。有它时客户端只读清单+本地算 md5，
+# 不再逐文件读共享（共享读取慢时差距很大）；没有清单则退回遍历目录比对。
+LAN_MANIFEST = "files.json"
+# 局域网目录里这些文件不参与比对/拷贝（发布方自己放的标记文件）
+LAN_EXCLUDE = ("version.txt", "更新说明.txt", LAN_MANIFEST)
+
+
 
 def base_dir():
     return BASE
@@ -107,7 +122,7 @@ def _iter_assets(assets, suffix):
     return hits
 
 
-def check_latest(timeout=12):
+def check_github(timeout=12):
     """访问 GitHub API，返回 dict：
     ok, local, latest, has_update, notes, published_at, page,
     asset_name, asset_url, asset_kind, error
@@ -115,7 +130,8 @@ def check_latest(timeout=12):
     local = local_version()
     out = {"ok": False, "local": local, "latest": "", "has_update": False,
            "notes": "", "published_at": "", "page": RELEASES_PAGE,
-           "asset_name": "", "asset_url": "", "asset_kind": "", "error": ""}
+           "asset_name": "", "asset_url": "", "asset_kind": "", "error": "",
+           "channel": "github"}
     try:
         req = urllib.request.Request(API_LATEST, headers={
             "User-Agent": "gas-doc-checker/%s" % local,
@@ -142,6 +158,53 @@ def check_latest(timeout=12):
     except Exception as exc:
         out["error"] = "连不上 GitHub：%s" % exc
     return out
+
+
+def check_lan():
+    """读局域网共享目录里的 version.txt，判断是否有更新。
+
+    返回结构与 GitHub 通道一致，额外带 channel="lan"、source_dir。
+    目录里可选放一个「更新说明.txt」，会作为 notes 显示在升级提示里。
+    """
+    local = local_version()
+    out = {"ok": False, "local": local, "latest": "", "has_update": False,
+           "notes": "", "published_at": "", "page": "",
+           "asset_name": "", "asset_url": "", "asset_kind": "",
+           "channel": "lan", "source_dir": LAN_ROOT, "error": ""}
+    try:
+        vp = os.path.join(LAN_ROOT, LAN_VERSION_FILE)
+        if not os.path.isfile(vp):
+            out["error"] = "局域网目录不可用或缺少 %s" % LAN_VERSION_FILE
+            return out
+        with open(vp, "r", encoding="utf-8", errors="replace") as fh:
+            latest = fh.read().strip()
+        out["latest"] = latest.lstrip("vV")
+        out["has_update"] = bool(out["latest"]) and compare_version(out["latest"], local) > 0
+        notes_path = os.path.join(LAN_ROOT, "更新说明.txt")
+        if os.path.isfile(notes_path):
+            try:
+                with open(notes_path, "r", encoding="utf-8", errors="replace") as fh:
+                    out["notes"] = fh.read()[:1200]
+            except Exception:
+                pass
+        out["ok"] = True
+    except Exception as exc:
+        out["error"] = "访问局域网共享失败：%s" % exc
+    return out
+
+
+def check_latest(timeout=12):
+    """检查更新：优先局域网共享目录，连不上/没有版本标记再回退 GitHub。"""
+    lan = check_lan()
+    if lan.get("ok"):
+        return lan
+    gh = check_github(timeout)
+    if not gh.get("ok"):
+        gh["error"] = "局域网：%s；GitHub：%s" % (
+            lan.get("error") or "不可用", gh.get("error") or "未知错误")
+    else:
+        gh["lan_error"] = lan.get("error") or ""
+    return gh
 
 
 def download_release(url, on_progress=None, timeout=300):
@@ -216,6 +279,58 @@ def _changed_files(src):
                 pass
             out.append(rel)
     return out
+
+
+def _changed_by_manifest(manifest):
+    """按清单比对本地文件（只读本地，不碰网络共享），返回变动文件的相对路径列表。"""
+    out = []
+    files = (manifest or {}).get("files") or {}
+    for rel, meta in files.items():
+        if rel in LAN_EXCLUDE:
+            continue
+        tp = os.path.join(BASE, rel)
+        try:
+            if not os.path.isfile(tp):
+                out.append(rel)
+                continue
+            size = meta.get("size")
+            if size is not None and os.path.getsize(tp) != size:
+                out.append(rel)
+                continue
+            if meta.get("md5") and _md5(tp) != meta["md5"]:
+                out.append(rel)
+        except Exception:
+            out.append(rel)
+    return out
+
+
+def _load_lan_manifest():
+    p = os.path.join(LAN_ROOT, LAN_MANIFEST)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if (data.get("files") or {}) else None
+    except Exception:
+        return None
+
+
+def make_manifest(src):
+    """生成发布用清单：{version, files: {rel: {size, md5}}}（发布脚本/局域网发布用）。"""
+    files = {}
+    for root, dirs, names in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in ("_tmp", "检查报告", "_改前备份", "__pycache__")]
+        for name in names:
+            p = os.path.join(root, name)
+            rel = os.path.relpath(p, src).replace("\\", "/")
+            if rel in LAN_EXCLUDE:
+                continue
+            try:
+                files[rel] = {"size": os.path.getsize(p), "md5": _md5(p)}
+            except Exception:
+                pass
+    return {"version": "", "files": files}
 
 
 def _backup(rel, tag):
@@ -338,6 +453,44 @@ def prepare_update(asset_path, tag):
         _backup(EXE_NAME, tag)
     bat = _write_pending_bat([EXE_NAME], src, tag, os.getpid())
     return bat, "已下载 v%s，程序即将关闭并完成替换" % tag
+
+
+def prepare_lan_update(tag, on_progress=None):
+    """局域网增量更新：先把有变动的文件拷到本地暂存，再走与 zip 相同的替换逻辑。
+
+    为什么要先落本地：退出后补拷用的 bat 只操作本地路径，不依赖网络共享
+    在程序退出后仍然可访问，也不会因为共享瞬时断开而卡住更新。
+    """
+    if not os.path.isdir(LAN_ROOT):
+        raise RuntimeError("局域网更新目录不可用：%s" % LAN_ROOT)
+    if not os.path.isfile(os.path.join(LAN_ROOT, EXE_NAME)):
+        raise RuntimeError("局域网更新目录里没有 %s，已取消更新" % EXE_NAME)
+    manifest = _load_lan_manifest()
+    if manifest:
+        # 快路径：只读文件的清单，md5 全在本地算，几乎不占网络
+        changed = _changed_by_manifest(manifest)
+    else:
+        # 兼容：没有清单时逐文件读共享比对（慢，但能工作）
+        changed = [rel for rel in _changed_files(LAN_ROOT) if rel not in LAN_EXCLUDE]
+    if not changed:
+        raise RuntimeError("局域网副本与当前版本内容一致，没有需要更新的文件")
+    work = os.path.join(BASE, "_tmp", "update", "lan")
+    if os.path.isdir(work):
+        shutil.rmtree(work, ignore_errors=True)
+    total = len(changed)
+    for i, rel in enumerate(changed):
+        sp = os.path.join(LAN_ROOT, rel)
+        tp = os.path.join(work, rel)
+        os.makedirs(os.path.dirname(tp), exist_ok=True)
+        shutil.copy2(sp, tp)
+        if on_progress:
+            on_progress(i + 1, total)
+    copied, deferred = _apply_now(work, changed, tag)
+    bat = _write_pending_bat(deferred, work, tag, os.getpid())
+    msg = ("已从局域网取到 v%s：共 %d 个文件有变动，其中 %d 个已当场替换%s"
+           % (tag, total, len(copied),
+              "，%d 个（程序本体等）将在退出后替换" % len(deferred) if deferred else ""))
+    return bat, msg
 
 
 def start_update(bat_path):
