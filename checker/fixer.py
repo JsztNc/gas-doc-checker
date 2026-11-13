@@ -73,27 +73,24 @@ def analyze(path):
     start = {k: n for k, n in ORDER}
     for ti, tbl in enumerate(doc.tables):
         kind = _table_kind(tbl)
-        fixed = None
-        if kind == "ganghan":                    # 焊接：号不变，只去空格
-            fixed = "keep"
-        elif kind in start:
-            fixed = start[kind]
+        fixed = "keep" if kind == "ganghan" else start.get(kind)
         if fixed is None:
             continue
+        seq = fixed if fixed != "keep" else 0
         for ri, row in enumerate(tbl.rows):
             for ci, cell in enumerate(row.cells):
                 hit = _code_in_cell(cell)
                 if not hit:
                     continue
-                pid, seq = hit
-                if fixed == "keep":
-                    new = "%sGX%04d" % (pid, seq)
-                else:
-                    new = "%sGX%04d" % (pid, fixed)
+                pid, oldseq = hit
+                # 焊接：保留本行原号只去空格；其余工序：按出现顺序连续编号，不把多行压成同一个号
+                new = "%sGX%04d" % (pid, oldseq if fixed == "keep" else seq)
                 old = cell.text.strip()
                 if old != new:
                     plan.append(("表%d %s R%dC%d" % (ti + 1, kind, ri + 1, ci + 1),
                                  old, new))
+                if fixed != "keep":
+                    seq += 1
                 break                                 # 一行只改第一个编号格
     return plan
 
@@ -108,15 +105,18 @@ def apply(path, out_path=None):
         fixed = "keep" if kind == "ganghan" else start.get(kind)
         if fixed is None:
             continue
+        seq = fixed if fixed != "keep" else 0
         for row in tbl.rows:
             for cell in row.cells:
                 hit = _code_in_cell(cell)
                 if not hit:
                     continue
-                pid, seq = hit
-                new = "%sGX%04d" % (pid, seq if fixed == "keep" else fixed)
+                pid, oldseq = hit
+                new = "%sGX%04d" % (pid, oldseq if fixed == "keep" else seq)
                 if _set_cell_code(cell, new):
                     changed += 1
+                if fixed != "keep":
+                    seq += 1
                 break
     doc.save(out_path or path)
     return changed
@@ -162,7 +162,13 @@ def add_members(path, people, out_path=None):
     if target is None:
         return 0
 
-    hdr = [c.text.strip() for c in target.rows[target.header_idx if hasattr(target, "header_idx") else 2].cells]
+    # 人员表表头：在前 3 行里找含「项目角色 / 姓名」那一行（python-docx 表无 header_idx）
+    hri = 0
+    for ri, row in enumerate(target.rows[:3]):
+        if any(("项目角色" in (c.text or "")) or ("姓名" in (c.text or "")) for c in row.cells):
+            hri = ri
+            break
+    hdr = [c.text.strip() for c in target.rows[hri].cells]
     def col(name):
         for i, h in enumerate(hdr):
             if name in h:
@@ -222,11 +228,256 @@ def suggest_members(path):
     return out
 
 
+# --------------------------------------------------------------------------
+# 新增自动修正（均有唯一正确答案的机械错误，可安全代改）：
+#   1) 项目编号统一   2) 汇总表检查次数修正   3) 发泡剂检漏备注补全
+# --------------------------------------------------------------------------
+import re as _re
+from collections import Counter
+from copy import deepcopy as _dc
+
+from docx import Document as _PyDoc
+from .docx_reader import Doc as _ParsedDoc
+from .rules import Facts as _Facts, bill_codes as _bill_codes
+
+STD_NOTE = "已采用发泡剂检查所有焊口、接口进行检查无渗漏均为合格"
+
+
+def _qn(tag):
+    from docx.oxml.ns import qn as _q
+    return _q(tag)
+
+
+def _find_col(tbl, *names):
+    """在表格前若干行里找含某字样的表头格，返回 (行号, 列号)，找不到 (-1,-1)。"""
+    for ri, row in enumerate(tbl.rows[:6]):
+        for ci, c in enumerate(row.cells):
+            t = _re.sub(r"\s+", "", c.text or "")
+            if any(n in t for n in names):
+                return ri, ci
+    return -1, -1
+
+
+def _append_text(cell, text):
+    """在单元格末尾追加一段文字（保留原有内容 / 格式）。"""
+    p = cell.paragraphs[-1] if cell.paragraphs else cell.add_paragraph()
+    run = p.add_run(text)
+    src = None
+    for pp in cell.paragraphs:
+        for r in pp.runs:
+            src = r
+            break
+        if src:
+            break
+    if src is not None:
+        rpr = src._r.find(_qn("w:rPr"))
+        if rpr is not None:
+            run._r.insert(0, _dc(rpr))
+    return run
+
+
+def _canonical_pid(parsed):
+    """取全套资料里出现最多的 项目编号/工程编号 作为规范值。"""
+    cnt = Counter()
+    for b in parsed.bills:
+        t = b.first_table()
+        if not t:
+            continue
+        kv = t.kv()
+        for k in ("项目编号", "工程编号"):
+            v = (kv.get(k) or "").replace(" ", "").upper()
+            if v:
+                cnt[v] += 1
+    return cnt.most_common(1)[0][0] if cnt else None
+
+
+def analyze_pid(path):
+    """dry-run：返回 [(位置, 旧值, 新值)]，不写文件。"""
+    parsed = _ParsedDoc(path)
+    pid = _canonical_pid(parsed)
+    if not pid:
+        return []
+    plan = []
+    for ti, tbl in enumerate(_PyDoc(path).tables):
+        for ri, row in enumerate(tbl.rows):
+            for ci, c in enumerate(row.cells):
+                if _re.sub(r"\s+", "", c.text or "") in ("项目编号", "工程编号"):
+                    if ci + 1 >= len(row.cells):
+                        continue
+                    nxt = row.cells[ci + 1]
+                    cur = _re.sub(r"\s+", "", nxt.text or "").upper()
+                    if cur and cur != pid:
+                        plan.append(("表%d R%dC%d" % (ti + 1, ri + 1, ci + 2),
+                                     nxt.text.strip(), pid))
+    return plan
+
+
+def apply_pid(path, out_path=None):
+    pid = _canonical_pid(_ParsedDoc(path))
+    if not pid:
+        return 0
+    doc = _PyDoc(path)
+    changed = 0
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for ci, c in enumerate(row.cells):
+                if _re.sub(r"\s+", "", c.text or "") in ("项目编号", "工程编号"):
+                    if ci + 1 >= len(row.cells):
+                        continue
+                    nxt = row.cells[ci + 1]
+                    cur = _re.sub(r"\s+", "", nxt.text or "").upper()
+                    if cur and cur != pid:
+                        _set_text(nxt, pid)
+                        changed += 1
+    doc.save(out_path or path)
+    return changed
+
+
+def _summary_count(parsed, name):
+    """汇总表某工序名称应写的检查次数（单据张数），无匹配返回 None。"""
+    facts = _Facts(parsed)
+    name = _re.sub(r"\s+", "", name or "")
+    if "强度" in name or "严密" in name:
+        indoors = True if "室内" in name else (False if "室外" in name else None)
+        strength = "强度" in name
+        sel = [b for b in facts.all("shiyan")
+               if (indoors is None or ("室内" in b.title) == indoors)
+               and (("强度" in b.title) == strength)]
+        if not sel:
+            return None
+        return sum(len(set(_bill_codes(b))) for b in sel)
+    FIXED = [("PE管电熔", "dianrong_jc"), ("PE管热熔", "rean_jc"),
+             ("钢质管道焊接", "ganghan"), ("螺纹连接", "luowen"), ("防腐", "fangfu"),
+             ("附属设施安装", "fujian"), ("沟槽回填", "huitian"), ("沟槽开挖", "wajue"),
+             ("隐蔽", "yinbi"), ("吹扫", "chuixao")]
+    for kw, kind in FIXED:
+        if kw in name:
+            b = facts.get(kind)
+            return len(set(_bill_codes(b))) if b else None
+    return None
+
+
+def analyze_summary(path):
+    parsed = _ParsedDoc(path)
+    plan = []
+    for ti, tbl in enumerate(_PyDoc(path).tables):
+        if _table_kind(tbl) != "huizong":
+            continue
+        hri, nci = _find_col(tbl, "工序名称")
+        _, cci = _find_col(tbl, "检查次数", "次数")
+        if nci < 0 or cci < 0:
+            continue
+        for ri in range(hri + 1, len(tbl.rows)):
+            row = tbl.rows[ri]
+            if cci >= len(row.cells):
+                continue
+            name = row.cells[nci].text.strip()
+            cur = _re.sub(r"\s+", "", row.cells[cci].text or "")
+            tgt = _summary_count(parsed, name)
+            if tgt is None:
+                continue
+            if cur != str(tgt):
+                plan.append(("表%d 汇总「%s」" % (ti + 1, name),
+                             row.cells[cci].text.strip() or "（空）", str(tgt)))
+    return plan
+
+
+def apply_summary(path, out_path=None):
+    doc = _PyDoc(path)
+    parsed = _ParsedDoc(path)
+    changed = 0
+    for tbl in doc.tables:
+        if _table_kind(tbl) != "huizong":
+            continue
+        hri, nci = _find_col(tbl, "工序名称")
+        _, cci = _find_col(tbl, "检查次数", "次数")
+        if nci < 0 or cci < 0:
+            continue
+        for ri in range(hri + 1, len(tbl.rows)):
+            row = tbl.rows[ri]
+            if cci >= len(row.cells):
+                continue
+            name = row.cells[nci].text.strip()
+            cur = _re.sub(r"\s+", "", row.cells[cci].text or "")
+            tgt = _summary_count(parsed, name)
+            if tgt is None:
+                continue
+            if cur != str(tgt):
+                _set_text(row.cells[cci], str(tgt))
+                changed += 1
+    doc.save(out_path or path)
+    return changed
+
+
+def analyze_note(path):
+    plan = []
+    for ti, tbl in enumerate(_PyDoc(path).tables):
+        k = _table_kind(tbl)
+        if k not in ("qiangdu", "mishi", "shiyan"):
+            continue
+        hri, bri = _find_col(tbl, "备注", "备注栏")
+        if bri < 0:
+            continue
+        has = any("发泡剂" in (tbl.rows[r].cells[bri].text or "")
+                  for r in range(hri + 1, len(tbl.rows)))
+        if has:
+            continue
+        target = None
+        for r in range(hri + 1, len(tbl.rows)):
+            if (tbl.rows[r].cells[bri].text or "").strip():
+                target = tbl.rows[r].cells[bri]
+                break
+        if target is None and hri + 1 < len(tbl.rows):
+            target = tbl.rows[hri + 1].cells[bri]
+        if target is not None:
+            plan.append(("表%d 试验备注" % (ti + 1),
+                         target.text.strip() or "（空）", STD_NOTE))
+    return plan
+
+
+def apply_note(path, out_path=None):
+    doc = _PyDoc(path)
+    changed = 0
+    for tbl in doc.tables:
+        k = _table_kind(tbl)
+        if k not in ("qiangdu", "mishi", "shiyan"):
+            continue
+        hri, bri = _find_col(tbl, "备注", "备注栏")
+        if bri < 0:
+            continue
+        has = any("发泡剂" in (tbl.rows[r].cells[bri].text or "")
+                  for r in range(hri + 1, len(tbl.rows)))
+        if has:
+            continue
+        target = None
+        for r in range(hri + 1, len(tbl.rows)):
+            if (tbl.rows[r].cells[bri].text or "").strip():
+                target = tbl.rows[r].cells[bri]
+                break
+        if target is None and hri + 1 < len(tbl.rows):
+            target = tbl.rows[hri + 1].cells[bri]
+        if target is None:
+            continue
+        prefix = "；" if (target.text or "").strip() else ""
+        _append_text(target, prefix + STD_NOTE)
+        changed += 1
+    doc.save(out_path or path)
+    return changed
+
+
 def fix_document(path, out_path=None, backup_dir=None):
-    """备份 → 重排编号 → 补人员，返回 {'backup':..., 'codes':n, 'members':n}"""
+    """备份 → 项目编号统一 → 汇总次数修正 → 发泡剂备注补全 → 重排编号 → 补人员。
+
+    返回 {'backup','pid','summary','note','codes','members','people'} 各组改动数。
+    PDF 暂不支持写回，显式报错提示先转 Word。
+    """
     import os
     import shutil
     import datetime
+
+    if path.lower().endswith(".pdf"):
+        raise RuntimeError("自动修正目前只支持 Word(.docx)；这份是 PDF，请先用 WPS/Adobe 的"
+                           "「PDF 转 Word」转成可编辑 Word 后再修正。")
 
     bak = None
     if backup_dir is not False:
@@ -238,7 +489,11 @@ def fix_document(path, out_path=None, backup_dir=None):
         shutil.copy2(path, bak)
 
     target = out_path or path
-    people = suggest_members(path)
-    n_codes = apply(path, target)
+    n_pid = apply_pid(path, target)
+    n_sum = apply_summary(target, target) if n_pid >= 0 else 0
+    n_note = apply_note(target, target)
+    n_codes = apply(target, target)
+    people = suggest_members(target)
     n_mem = add_members(target, people) if people else 0
-    return {"backup": bak, "codes": n_codes, "members": n_mem, "people": people}
+    return {"backup": bak, "pid": n_pid, "summary": n_sum, "note": n_note,
+            "codes": n_codes, "members": n_mem, "people": people}

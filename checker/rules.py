@@ -513,14 +513,19 @@ def r_finish_order(f):
     return out
 
 
-def r_summary(f):
-    """汇总表检查次数 vs 前面单张工序记录的实际条数。"""
-    out = []
-    hz = f.get("huizong")
-    if not hz:
-        return [Finding(INFO, "无法核对汇总表", "文档里没有工序质量检查汇总表")]
-    t = hz.first_table()
-    i_n, i_c = t.col("工序名称"), t.col("检查次数")
+def summary_target(f, name):
+    """汇总表某「工序名称」应写的检查次数（= 对应单据张数）。
+
+    返回 (level, count) 或 (None, None)。count 取「单据张数」（单据编号去重后的个数），
+    与《校验要点》"检查次数按记录单张数计"一致；r_summary 也用它判定，确保检查 / 修正口径一致。
+    """
+    name = re.sub(r"\s+", "", name or "")
+    FIXED = [("PE管电熔", "dianrong_jc", "warn"), ("PE管热熔", "rean_jc", "warn"),
+             ("钢质管道焊接", "ganghan", "warn"), ("螺纹连接", "luowen", "err"),
+             ("防腐", "fangfu", "err"), ("附属设施安装", "fujian", "err"),
+             ("沟槽回填", "huitian", "err"), ("回填", "huitian", "err"),
+             ("沟槽开挖", "wajue", "err"), ("开挖", "wajue", "err"),
+             ("隐蔽", "yinbi", "err"), ("吹扫", "chuixao", "err")]
 
     def counts(kind):
         b = f.get(kind)
@@ -538,40 +543,38 @@ def r_summary(f):
         codes = sum(len(set(bill_codes(b))) for b in sel)
         return rows, codes
 
-    FIXED = [("PE管电熔", "dianrong_jc", "warn"), ("PE管热熔", "rean_jc", "warn"),
-             ("钢质管道焊接", "ganghan", "warn"), ("螺纹连接", "luowen", "err"),
-             ("防腐", "fangfu", "err"), ("附属设施安装", "fujian", "err"),
-             ("沟槽回填", "huitian", "err"), ("回填", "huitian", "err"),
-             ("沟槽开挖", "wajue", "err"), ("开挖", "wajue", "err"),
-             ("隐蔽", "yinbi", "err"), ("吹扫", "chuixao", "err")]
+    for kw, kind, lv in FIXED:
+        if kw in name:
+            tgt = counts(kind)
+            return (WARN if lv == "warn" else ERR), (tgt[1] if tgt else None)
+    if "强度" in name or "严密" in name:
+        indoors = True if "室内" in name else (False if "室外" in name else None)
+        tgt = shiyan(indoors, "强度" in name)
+        return WARN, (tgt[1] if tgt else None)
+    return None, None
+
+
+def r_summary(f):
+    """汇总表检查次数 vs 前面单张工序记录的实际条数。"""
+    out = []
+    hz = f.get("huizong")
+    if not hz:
+        return [Finding(INFO, "无法核对汇总表", "文档里没有工序质量检查汇总表")]
+    t = hz.first_table()
+    i_n, i_c = t.col("工序名称"), t.col("检查次数")
     for row in t.records():
         name = cell(row, i_n)
         try:
             cnt = int(float(cell(row, i_c) or 0))
         except ValueError:
             continue
-        target = None
-        level = ERR
-        for kw, kind, lv in FIXED:
-            if kw in name:
-                target = counts(kind)
-                level = WARN if lv == "warn" else ERR
-                break
-        if target is None and ("强度" in name or "严密" in name):
-            level = WARN
-            if "室内" in name:
-                target = shiyan(True, "强度" in name)
-            elif "室外" in name:
-                target = shiyan(False, "强度" in name)
-            else:
-                target = shiyan(None, "强度" in name)
-        if not target:
+        level, tgt = summary_target(f, name)
+        if tgt is None:
             continue
-        rows, codes = target
-        if cnt not in (rows, codes):
+        if cnt != tgt:
             out.append(Finding(level, "汇总次数对不上",
-                               "汇总表「%s」写 %d 次；前面明细 %d 条、单据 %d 个（两者都对不上，"
-                               "按规范应以单据张数计）" % (name, cnt, rows, codes)))
+                               "汇总表「%s」写 %d 次；按规范应以实际单据张数 %d 计"
+                               % (name, cnt, tgt)))
     return out
 
 

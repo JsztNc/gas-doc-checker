@@ -504,10 +504,14 @@ class App(object):
         if not path and not code:
             MessageBox.Show(self.form, "先输入工程编号并检查一次，再点自动修正", "自动修正")
             return
-        ask = ("将按规范自动修正这份资料：\n\n"
+        ask = ("将按规范自动修正这份资料（原文件先备份到同目录「_改前备份」）：\n\n"
                "· 单据编号：去掉空格、按工序重排流水、消除重复\n"
+               "· 项目编号：整套统一为同一个编号\n"
+               "· 工序质量汇总表：检查次数按实际单据张数回写\n"
+               "· 试验记录：备注栏补「发泡剂检漏」标准句\n"
                "· 项目人员信息表：把特种工名单补齐\n\n"
-               "原文件会先备份到同目录「_改前备份」文件夹。要开始吗？")
+               "注：只改格式 / 编号 / 次数 / 统一文本这类机械错误；时间先后、米数取舍、"
+               "缺哪张单、照片与签字盖章等需判断的，仍要人工。要开始吗？")
         if MessageBox.Show(self.form, ask, "自动修正",
                            MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes:
             return
@@ -618,12 +622,22 @@ class App(object):
             fx = data["fix"]
             self.fixing = False
             who = "、".join(x[0] for x in fx.get("people") or []) or "无"
+            parts = []
+            if fx.get("codes"):
+                parts.append("· 单据编号 %d 处（去空格、重排流水、消除重复）" % fx["codes"])
+            if fx.get("pid"):
+                parts.append("· 统一项目编号 %d 处" % fx["pid"])
+            if fx.get("summary"):
+                parts.append("· 修正汇总表检查次数 %d 处" % fx["summary"])
+            if fx.get("note"):
+                parts.append("· 补全发泡剂检漏备注 %d 张" % fx["note"])
+            if fx.get("members"):
+                parts.append("· 补充人员 %d 人（%s）" % (fx["members"], who))
+            if not parts:
+                parts.append("· 没有可自动修正的问题")
             MessageBox.Show(self.form,
-                            "已自动修正：\n\n"
-                            "· 单据编号 %d 处（去空格、重排流水、消除重复）\n"
-                            "· 补充人员 %d 人（%s）\n\n"
-                            "改前备份：%s" % (fx.get("codes", 0), fx.get("members", 0), who,
-                                         fx.get("backup") or "-"),
+                            "已自动修正：\n\n" + "\n".join(parts)
+                            + "\n\n改前备份：%s" % (fx.get("backup") or "-"),
                             "自动修正完成", MessageBoxButtons.OK, MessageBoxIcon.Information)
 
 
